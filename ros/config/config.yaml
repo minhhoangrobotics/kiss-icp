@@ -17,11 +17,11 @@ kiss_icp_node:
 
     data:
       deskew: True
-      max_range: 100.0
-      min_range: 0.0
+      max_range: 20.0
+      min_range: 0.3
 
     mapping:
-      # voxel_size: 1.0 # <- optional, default = max_range / 100.0
+      voxel_size: 0.05
       max_points_per_voxel: 20
 
     adaptive_threshold:
