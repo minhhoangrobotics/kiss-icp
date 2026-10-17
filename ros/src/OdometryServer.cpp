@@ -21,6 +21,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include <Eigen/Core>
+#include <algorithm>
 #include <memory>
 #include <sophus/se3.hpp>
 #include <utility>
@@ -48,26 +49,6 @@
 #include <tf2_ros/static_transform_broadcaster.hpp>
 #include <tf2_ros/transform_broadcaster.hpp>
 
-namespace {
-Sophus::SE3d LookupTransform(const std::string &target_frame,
-                             const std::string &source_frame,
-                             const std::unique_ptr<tf2_ros::Buffer> &tf2_buffer) {
-    std::string err_msg;
-    if (tf2_buffer->canTransform(target_frame, source_frame, tf2::TimePointZero, &err_msg)) {
-        try {
-            auto tf = tf2_buffer->lookupTransform(target_frame, source_frame, tf2::TimePointZero);
-            return tf2::transformToSophus(tf);
-        } catch (tf2::TransformException &ex) {
-            RCLCPP_WARN(rclcpp::get_logger("LookupTransform"), "%s", ex.what());
-        }
-    }
-    RCLCPP_WARN(rclcpp::get_logger("LookupTransform"), "Failed to find tf. Reason=%s",
-                err_msg.c_str());
-    // default construction is the identity
-    return Sophus::SE3d();
-}
-}  // namespace
-
 namespace kiss_icp_ros {
 
 using utils::EigenToPointCloud2;
@@ -84,7 +65,9 @@ OdometryServer::OdometryServer(const rclcpp::NodeOptions &options)
 
     // Initialize subscribers
     pointcloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-        "pointcloud_topic", rclcpp::QoS(10).reliable(),
+        // ICP can take longer than one scan period on the simulation host.
+        // Keep the freshest scan instead of feeding stale scans to the graph.
+        "pointcloud_topic", rclcpp::SensorDataQoS().keep_last(1),
         std::bind(&OdometryServer::RegisterFrame, this, std::placeholders::_1));
 
     // Initialize publishers
@@ -122,6 +105,7 @@ void OdometryServer::initializeParameters(kiss_icp::pipeline::KISSConfig &config
     RCLCPP_INFO(this->get_logger(), "\tInvert odometry transform: %d", invert_odom_tf_);
     publish_debug_clouds_ = declare_parameter<bool>("publish_debug_clouds", publish_debug_clouds_);
     RCLCPP_INFO(this->get_logger(), "\tPublish debug clouds: %d", publish_debug_clouds_);
+    debug_map_max_points_ = declare_parameter<int>("debug_map_max_points", 5000);
     position_covariance_ = declare_parameter<double>("position_covariance", 0.1);
     RCLCPP_INFO(this->get_logger(), "\tPosition covariance: %.2f", position_covariance_);
     orientation_covariance_ = declare_parameter<double>("orientation_covariance", 0.1);
@@ -185,11 +169,24 @@ void OdometryServer::PublishOdometry(const Sophus::SE3d &kiss_pose,
     const auto cloud_frame_id = header.frame_id;
     const auto egocentric_estimation = (base_frame_.empty() || base_frame_ == cloud_frame_id);
     const auto moving_frame = egocentric_estimation ? cloud_frame_id : base_frame_;
-    const auto pose = [&]() -> Sophus::SE3d {
-        if (egocentric_estimation) return kiss_pose;
-        const Sophus::SE3d cloud2base = LookupTransform(base_frame_, cloud_frame_id, tf2_buffer_);
-        return cloud2base * kiss_pose * cloud2base.inverse();
-    }();
+    Sophus::SE3d pose = kiss_pose;
+    if (!egocentric_estimation) {
+        try {
+            // The torso-mounted LiDAR moves relative to base_link while G1 walks.
+            // Use this scan's transform and retain the first transform to express
+            // the LiDAR odometry origin at the initial base pose.
+            const auto tf = tf2_buffer_->lookupTransform(
+                base_frame_, cloud_frame_id, rclcpp::Time(header.stamp),
+                rclcpp::Duration::from_seconds(0.02));
+            const Sophus::SE3d current_base_to_lidar = tf2::transformToSophus(tf);
+            if (!initial_base_to_lidar_) initial_base_to_lidar_ = current_base_to_lidar;
+            pose = *initial_base_to_lidar_ * kiss_pose * current_base_to_lidar.inverse();
+        } catch (const tf2::TransformException &error) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                                 "LiDAR odometry transform unavailable at scan time: %s", error.what());
+            return;
+        }
+    }
 
     // Broadcast the tf ---
     if (publish_odom_tf_) {
@@ -226,13 +223,18 @@ void OdometryServer::PublishOdometry(const Sophus::SE3d &kiss_pose,
 void OdometryServer::PublishClouds(const std::vector<Eigen::Vector3d> &frame,
                                    const std::vector<Eigen::Vector3d> &keypoints,
                                    const std_msgs::msg::Header &header) {
-    const auto kiss_map = kiss_icp_->LocalMap();
-
     frame_publisher_->publish(std::move(EigenToPointCloud2(frame, header)));
     kpoints_publisher_->publish(std::move(EigenToPointCloud2(keypoints, header)));
+    if (map_publisher_->get_subscription_count() == 0) return;
+    const auto kiss_map = kiss_icp_->LocalMap();
+    std::vector<Eigen::Vector3d> display_map;
+    const size_t limit = static_cast<size_t>(std::max(1, debug_map_max_points_));
+    const size_t stride = std::max<size_t>(1, (kiss_map.size() + limit - 1) / limit);
+    display_map.reserve(std::min(kiss_map.size(), limit));
+    for (size_t i = 0; i < kiss_map.size(); i += stride) display_map.push_back(kiss_map[i]);
     auto local_map_header = header;
     local_map_header.frame_id = lidar_odom_frame_;
-    map_publisher_->publish(std::move(EigenToPointCloud2(kiss_map, local_map_header)));
+    map_publisher_->publish(std::move(EigenToPointCloud2(display_map, local_map_header)));
 }
 void OdometryServer::ResetService(
     [[maybe_unused]] const std::shared_ptr<std_srvs::srv::Empty::Request> request,
@@ -241,6 +243,7 @@ void OdometryServer::ResetService(
 
     // Reset the KISS-ICP pipeline
     kiss_icp_->Reset();
+    initial_base_to_lidar_.reset();
 
     RCLCPP_INFO(this->get_logger(), "KISS-ICP reset completed successfully");
 }

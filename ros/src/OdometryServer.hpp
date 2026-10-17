@@ -31,6 +31,7 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/header.hpp>
 #include <std_srvs/srv/empty.hpp>
+#include <optional>
 #include <string>
 #include <tf2_ros/buffer.hpp>
 #include <tf2_ros/transform_broadcaster.hpp>
@@ -70,6 +71,7 @@ private:
     bool invert_odom_tf_;
     bool publish_odom_tf_;
     bool publish_debug_clouds_;
+    int debug_map_max_points_;
 
     /// Data subscribers.
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_sub_;
@@ -89,6 +91,7 @@ private:
     /// Global/map coordinate frame.
     std::string lidar_odom_frame_{"odom_lidar"};
     std::string base_frame_{};
+    std::optional<Sophus::SE3d> initial_base_to_lidar_;
 
     /// Covariance diagonal
     double position_covariance_;
