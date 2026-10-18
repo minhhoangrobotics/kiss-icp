@@ -32,6 +32,7 @@
 #include <std_msgs/msg/header.hpp>
 #include <std_srvs/srv/empty.hpp>
 #include <optional>
+#include <deque>
 #include <string>
 #include <tf2_ros/buffer.hpp>
 #include <tf2_ros/transform_broadcaster.hpp>
@@ -54,7 +55,9 @@ private:
     void RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg);
 
     /// Stream the estimated pose to ROS
-    void PublishOdometry(const Sophus::SE3d &kiss_pose, const std_msgs::msg::Header &header);
+    void PublishOdometry(const Sophus::SE3d &kiss_pose, const std_msgs::msg::Header &header,
+                         const Sophus::SE3d &base_to_lidar);
+    std::optional<Sophus::SE3d> LegPoseAt(const rclcpp::Time &stamp) const;
 
     /// Stream the debugging point clouds for visualization (if required)
     void PublishClouds(const std::vector<Eigen::Vector3d> &frame,
@@ -75,6 +78,11 @@ private:
 
     /// Data subscribers.
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_sub_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr leg_odom_sub_;
+    std::deque<nav_msgs::msg::Odometry::ConstSharedPtr> recent_leg_poses_;
+    std::optional<Sophus::SE3d> previous_leg_pose_;
+    std::optional<Sophus::SE3d> previous_base_to_lidar_;
+    bool use_leg_prediction_ = false;
 
     /// Data publishers.
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_publisher_;

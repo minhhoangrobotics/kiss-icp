@@ -22,6 +22,7 @@
 // SOFTWARE.
 #include <Eigen/Core>
 #include <algorithm>
+#include <cmath>
 #include <memory>
 #include <sophus/se3.hpp>
 #include <utility>
@@ -69,6 +70,18 @@ OdometryServer::OdometryServer(const rclcpp::NodeOptions &options)
         // Keep the freshest scan instead of feeding stale scans to the graph.
         "pointcloud_topic", rclcpp::SensorDataQoS().keep_last(1),
         std::bind(&OdometryServer::RegisterFrame, this, std::placeholders::_1));
+    use_leg_prediction_ = declare_parameter<bool>("use_leg_prediction", false);
+    if (use_leg_prediction_) {
+        leg_odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+            "leg_odometry_topic", 20, [this](const nav_msgs::msg::Odometry::ConstSharedPtr msg) {
+                recent_leg_poses_.push_back(msg);
+                const double newest = rclcpp::Time(msg->header.stamp).seconds();
+                while (!recent_leg_poses_.empty() &&
+                       newest - rclcpp::Time(recent_leg_poses_.front()->header.stamp).seconds() > 3.0) {
+                    recent_leg_poses_.pop_front();
+                }
+            });
+    }
 
     // Initialize publishers
     rclcpp::QoS qos((rclcpp::SystemDefaultsQoS().keep_last(1).durability_volatile()));
@@ -145,47 +158,85 @@ void OdometryServer::initializeParameters(kiss_icp::pipeline::KISSConfig &config
 }
 
 void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg) {
-    const auto cloud_frame_id = msg->header.frame_id;
+    Sophus::SE3d base_to_lidar;
+    if (!base_frame_.empty() && base_frame_ != msg->header.frame_id) {
+        try {
+            const auto tf = tf2_buffer_->lookupTransform(
+                base_frame_, msg->header.frame_id, rclcpp::Time(msg->header.stamp),
+                rclcpp::Duration::from_seconds(0.06));
+            base_to_lidar = tf2::transformToSophus(tf);
+        } catch (const tf2::TransformException &error) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                                 "Waiting for LiDAR TF at scan stamp: %s", error.what());
+            return;
+        }
+    }
+    const auto leg_pose = use_leg_prediction_ ? LegPoseAt(rclcpp::Time(msg->header.stamp)) :
+                                            std::optional<Sophus::SE3d>{};
+    std::optional<Sophus::SE3d> pose_hint;
+    if (leg_pose && previous_leg_pose_ && previous_base_to_lidar_) {
+        const Sophus::SE3d leg_delta = previous_leg_pose_->inverse() * *leg_pose;
+        const double translation = leg_delta.translation().norm();
+        if (translation < 2.0) {
+            // Predict LiDAR motion in KISS's local frame; ICP still refines this pose.
+            pose_hint = kiss_icp_->pose() * previous_base_to_lidar_->inverse() *
+                        leg_delta * base_to_lidar;
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000,
+                                 "KISS scan registration using leg odometry prediction");
+        }
+    }
     const auto points = PointCloud2ToEigen(msg);
     const auto timestamps = GetTimestamps(msg);
 
     // Register frame, main entry point to KISS-ICP pipeline
-    const auto &[frame, keypoints] = kiss_icp_->RegisterFrame(points, timestamps);
+    const auto &[frame, keypoints] = kiss_icp_->RegisterFrame(points, timestamps, pose_hint);
+    if (leg_pose) {
+        previous_leg_pose_ = *leg_pose;
+        previous_base_to_lidar_ = base_to_lidar;
+    } else {
+        previous_leg_pose_.reset();
+        previous_base_to_lidar_.reset();
+    }
 
     // Extract the last KISS-ICP pose, ego-centric to the LiDAR
     const Sophus::SE3d kiss_pose = kiss_icp_->pose();
 
     // Spit the current estimated pose to ROS msgs handling the desired target frame
-    PublishOdometry(kiss_pose, msg->header);
+    PublishOdometry(kiss_pose, msg->header, base_to_lidar);
     // Publishing these clouds is a bit costly, so do it only if we are debugging
     if (publish_debug_clouds_) {
         PublishClouds(frame, keypoints, msg->header);
     }
 }
 
+std::optional<Sophus::SE3d> OdometryServer::LegPoseAt(const rclcpp::Time &stamp) const {
+    double nearest_error = 0.2;
+    std::optional<Sophus::SE3d> result;
+    for (const auto &item : recent_leg_poses_) {
+        const double error = std::abs((rclcpp::Time(item->header.stamp) - stamp).seconds());
+        if (error >= nearest_error) continue;
+        const auto &p = item->pose.pose.position;
+        const auto &q = item->pose.pose.orientation;
+        const Eigen::Quaterniond quaternion(q.w, q.x, q.y, q.z);
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) ||
+            !std::isfinite(quaternion.squaredNorm()) || quaternion.squaredNorm() < 0.5) continue;
+        nearest_error = error;
+        result = Sophus::SE3d(quaternion.normalized(), Eigen::Vector3d(p.x, p.y, p.z));
+    }
+    return result;
+}
+
 void OdometryServer::PublishOdometry(const Sophus::SE3d &kiss_pose,
-                                     const std_msgs::msg::Header &header) {
+                                     const std_msgs::msg::Header &header,
+                                     const Sophus::SE3d &base_to_lidar) {
     // If necessary, transform the ego-centric pose to the specified base_link/base_footprint frame
     const auto cloud_frame_id = header.frame_id;
     const auto egocentric_estimation = (base_frame_.empty() || base_frame_ == cloud_frame_id);
     const auto moving_frame = egocentric_estimation ? cloud_frame_id : base_frame_;
     Sophus::SE3d pose = kiss_pose;
     if (!egocentric_estimation) {
-        try {
-            // The torso-mounted LiDAR moves relative to base_link while G1 walks.
-            // Use this scan's transform and retain the first transform to express
-            // the LiDAR odometry origin at the initial base pose.
-            const auto tf = tf2_buffer_->lookupTransform(
-                base_frame_, cloud_frame_id, rclcpp::Time(header.stamp),
-                rclcpp::Duration::from_seconds(0.02));
-            const Sophus::SE3d current_base_to_lidar = tf2::transformToSophus(tf);
-            if (!initial_base_to_lidar_) initial_base_to_lidar_ = current_base_to_lidar;
-            pose = *initial_base_to_lidar_ * kiss_pose * current_base_to_lidar.inverse();
-        } catch (const tf2::TransformException &error) {
-            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-                                 "LiDAR odometry transform unavailable at scan time: %s", error.what());
-            return;
-        }
+        if (!initial_base_to_lidar_) initial_base_to_lidar_ = base_to_lidar;
+        pose = *initial_base_to_lidar_ * kiss_pose * base_to_lidar.inverse();
     }
 
     // Broadcast the tf ---
@@ -244,6 +295,8 @@ void OdometryServer::ResetService(
     // Reset the KISS-ICP pipeline
     kiss_icp_->Reset();
     initial_base_to_lidar_.reset();
+    previous_leg_pose_.reset();
+    previous_base_to_lidar_.reset();
 
     RCLCPP_INFO(this->get_logger(), "KISS-ICP reset completed successfully");
 }
