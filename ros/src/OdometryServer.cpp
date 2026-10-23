@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cmath>
 #include <memory>
+#include <stdexcept>
 #include <sophus/se3.hpp>
 #include <utility>
 #include <vector>
@@ -45,7 +46,10 @@
 #include <rclcpp/qos.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/msg/imu.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/float32_multi_array.hpp>
 #include <std_srvs/srv/empty.hpp>
 #include <tf2_ros/static_transform_broadcaster.hpp>
 #include <tf2_ros/transform_broadcaster.hpp>
@@ -71,6 +75,8 @@ OdometryServer::OdometryServer(const rclcpp::NodeOptions &options)
         "pointcloud_topic", rclcpp::SensorDataQoS().keep_last(1),
         std::bind(&OdometryServer::RegisterFrame, this, std::placeholders::_1));
     use_leg_prediction_ = declare_parameter<bool>("use_leg_prediction", false);
+    RCLCPP_INFO(get_logger(), "Leg motion prediction for KISS ICP: %s",
+                use_leg_prediction_ ? "enabled" : "disabled");
     if (use_leg_prediction_) {
         leg_odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
             "leg_odometry_topic", 20, [this](const nav_msgs::msg::Odometry::ConstSharedPtr msg) {
@@ -82,10 +88,29 @@ OdometryServer::OdometryServer(const rclcpp::NodeOptions &options)
                 }
             });
     }
+    use_imu_prediction_ = declare_parameter<bool>("use_imu_prediction", false);
+    if (use_imu_prediction_) {
+        imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
+            "imu_topic", rclcpp::SensorDataQoS().keep_last(50),
+            [this](const sensor_msgs::msg::Imu::ConstSharedPtr msg) {
+                recent_imu_.push_back(msg);
+                const auto newest = rclcpp::Time(msg->header.stamp);
+                while (!recent_imu_.empty() &&
+                       (newest - rclcpp::Time(recent_imu_.front()->header.stamp)).seconds() > 2.0) {
+                    recent_imu_.pop_front();
+                }
+            });
+    }
+    RCLCPP_INFO(get_logger(), "IMU rotation prediction for KISS ICP: %s",
+                use_imu_prediction_ ? "enabled" : "disabled");
 
     // Initialize publishers
     rclcpp::QoS qos((rclcpp::SystemDefaultsQoS().keep_last(1).durability_volatile()));
     odom_publisher_ = create_publisher<nav_msgs::msg::Odometry>("kiss/odometry", qos);
+    registration_status_publisher_ = create_publisher<std_msgs::msg::Bool>(
+        "kiss/registration_accepted", qos);
+    quality_publisher_ = create_publisher<std_msgs::msg::Float32MultiArray>(
+        "kiss/registration_quality", qos);
     if (publish_debug_clouds_) {
         frame_publisher_ = create_publisher<sensor_msgs::msg::PointCloud2>("kiss/frame", qos);
         kpoints_publisher_ = create_publisher<sensor_msgs::msg::PointCloud2>("kiss/keypoints", qos);
@@ -150,6 +175,17 @@ void OdometryServer::initializeParameters(kiss_icp::pipeline::KISSConfig &config
     config.max_num_threads =
         declare_parameter<int>("registration.max_num_threads", config.max_num_threads);
     RCLCPP_INFO(this->get_logger(), "\tMax number of threads: %d", config.max_num_threads);
+    config.quality_gate = declare_parameter<bool>("quality.enabled", config.quality_gate);
+    config.min_inlier_ratio = declare_parameter<double>("quality.min_inlier_ratio", config.min_inlier_ratio);
+    config.max_inlier_rmse = declare_parameter<double>("quality.max_inlier_rmse", config.max_inlier_rmse);
+    config.inlier_distance = declare_parameter<double>("quality.inlier_distance", config.inlier_distance);
+    config.max_prior_translation = declare_parameter<double>("quality.max_prior_translation", config.max_prior_translation);
+    config.max_prior_rotation = declare_parameter<double>("quality.max_prior_rotation", config.max_prior_rotation);
+    if (config.min_inlier_ratio < 0.0 || config.min_inlier_ratio > 1.0 ||
+        config.max_inlier_rmse <= 0.0 || config.inlier_distance <= 0.0 ||
+        config.max_prior_translation <= 0.0 || config.max_prior_rotation <= 0.0) {
+        throw std::invalid_argument("Invalid KISS quality gate parameters");
+    }
     if (config.max_range < config.min_range) {
         RCLCPP_WARN(get_logger(),
                     "[WARNING] max_range is smaller than min_range, setting min_range to 0.0");
@@ -173,16 +209,39 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
     }
     const auto leg_pose = use_leg_prediction_ ? LegPoseAt(rclcpp::Time(msg->header.stamp)) :
                                             std::optional<Sophus::SE3d>{};
+    if (use_leg_prediction_ && !leg_pose) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                             "No leg odometry near LiDAR timestamp; KISS uses its own motion estimate");
+    }
+    const auto imu_orientation = use_imu_prediction_ ? ImuBaseOrientationAt(rclcpp::Time(msg->header.stamp)) :
+                                                        std::optional<Eigen::Quaterniond>{};
     std::optional<Sophus::SE3d> pose_hint;
-    if (leg_pose && previous_leg_pose_ && previous_base_to_lidar_) {
-        const Sophus::SE3d leg_delta = previous_leg_pose_->inverse() * *leg_pose;
-        const double translation = leg_delta.translation().norm();
-        if (translation < 2.0) {
-            // Predict LiDAR motion in KISS's local frame; ICP still refines this pose.
+    if (previous_base_to_lidar_) {
+        // KISS predicts translation from its last accepted LiDAR motion. Leg
+        // odometry can replace that translation, but IMU owns the rotation.
+        Sophus::SE3d base_delta = *previous_base_to_lidar_ * kiss_icp_->delta() *
+                                  base_to_lidar.inverse();
+        if (leg_pose && previous_leg_pose_) {
+            const auto leg_delta = previous_leg_pose_->inverse() * *leg_pose;
+            if (leg_delta.translation().norm() < 0.8) {
+                base_delta.translation() = leg_delta.translation();
+            }
+        }
+        if (imu_orientation && previous_imu_base_orientation_ &&
+            previous_scan_stamp_.nanoseconds() != 0 &&
+            (rclcpp::Time(msg->header.stamp) - previous_scan_stamp_).seconds() < 0.5) {
+            const Eigen::Quaterniond delta = previous_imu_base_orientation_->inverse() *
+                                              *imu_orientation;
+            if (Eigen::AngleAxisd(delta).angle() < 1.0) {
+                base_delta = Sophus::SE3d(Sophus::SO3d(delta), base_delta.translation());
+                RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000,
+                                     "KISS prediction: IMU rotation and %s translation",
+                                     leg_pose && previous_leg_pose_ ? "leg" : "LiDAR");
+            }
+        }
+        if (base_delta.translation().allFinite() && base_delta.translation().norm() < 0.8) {
             pose_hint = kiss_icp_->pose() * previous_base_to_lidar_->inverse() *
-                        leg_delta * base_to_lidar;
-            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000,
-                                 "KISS scan registration using leg odometry prediction");
+                        base_delta * base_to_lidar;
         }
     }
     const auto points = PointCloud2ToEigen(msg);
@@ -190,12 +249,33 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
 
     // Register frame, main entry point to KISS-ICP pipeline
     const auto &[frame, keypoints] = kiss_icp_->RegisterFrame(points, timestamps, pose_hint);
-    if (leg_pose) {
+    const auto &quality = kiss_icp_->registration_quality();
+    std_msgs::msg::Bool accepted_msg;
+    accepted_msg.data = quality.accepted;
+    registration_status_publisher_->publish(accepted_msg);
+    std_msgs::msg::Float32MultiArray quality_msg;
+    quality_msg.data = {static_cast<float>(quality.inlier_ratio),
+                        static_cast<float>(quality.rmse),
+                        static_cast<float>(quality.translation_deviation),
+                        static_cast<float>(quality.rotation_deviation)};
+    quality_publisher_->publish(quality_msg);
+    if (kiss_icp_->registration_accepted()) {
+      previous_scan_stamp_ = rclcpp::Time(msg->header.stamp);
+      previous_base_to_lidar_ = base_to_lidar;
+      previous_imu_base_orientation_ = imu_orientation;
+    }
+    if (leg_pose && kiss_icp_->registration_accepted()) {
         previous_leg_pose_ = *leg_pose;
-        previous_base_to_lidar_ = base_to_lidar;
-    } else {
+    } else if (!leg_pose) {
         previous_leg_pose_.reset();
-        previous_base_to_lidar_.reset();
+    }
+
+    if (!kiss_icp_->registration_accepted()) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                             "KISS rejected scan: inliers %.2f, RMSE %.3f m, prior deviation %.3f m / %.3f rad",
+                             quality.inlier_ratio, quality.rmse, quality.translation_deviation,
+                             quality.rotation_deviation);
+        return;  // Do not send a rejected LiDAR factor to Graph MSF.
     }
 
     // Extract the last KISS-ICP pose, ego-centric to the LiDAR
@@ -224,6 +304,50 @@ std::optional<Sophus::SE3d> OdometryServer::LegPoseAt(const rclcpp::Time &stamp)
         result = Sophus::SE3d(quaternion.normalized(), Eigen::Vector3d(p.x, p.y, p.z));
     }
     return result;
+}
+
+std::optional<Eigen::Quaterniond> OdometryServer::ImuBaseOrientationAt(const rclcpp::Time &stamp) {
+    if (recent_imu_.empty()) return std::nullopt;
+    sensor_msgs::msg::Imu::ConstSharedPtr before, after;
+    for (const auto &item : recent_imu_) {
+        if (rclcpp::Time(item->header.stamp) <= stamp) before = item;
+        else { after = item; break; }
+    }
+    const auto sample = before ? before : after;
+    if (!sample || std::abs((stamp - rclcpp::Time(sample->header.stamp)).seconds()) > 0.04 ||
+        sample->header.frame_id.empty()) return std::nullopt;
+    auto from_msg = [](const sensor_msgs::msg::Imu::ConstSharedPtr &item) {
+        const auto &q = item->orientation;
+        return Eigen::Quaterniond(q.w, q.x, q.y, q.z).normalized();
+    };
+    Eigen::Quaterniond world_imu = from_msg(sample);
+    if (before && after) {
+        const auto dt = (rclcpp::Time(after->header.stamp) -
+                         rclcpp::Time(before->header.stamp)).seconds();
+        if (dt > 0.0 && dt < 0.04) {
+            const double ratio = (stamp - rclcpp::Time(before->header.stamp)).seconds() / dt;
+            world_imu = from_msg(before).slerp(ratio, from_msg(after));
+        }
+    }
+    if (!world_imu.coeffs().allFinite() || world_imu.norm() < 0.5) return std::nullopt;
+    if (!base_to_imu_rotation_ || cached_imu_frame_ != sample->header.frame_id) {
+        try {
+            // The G1 IMU is rigidly attached to pelvis/base_link. Cache the
+            // extrinsic so a late joint TF cannot discard a valid IMU sample.
+            const auto tf = tf2_buffer_->lookupTransform(
+                base_frame_, sample->header.frame_id, tf2::TimePointZero);
+            const auto &q = tf.transform.rotation;
+            const Eigen::Quaterniond base_imu(q.w, q.x, q.y, q.z);
+            if (!base_imu.coeffs().allFinite() || base_imu.norm() < 0.5) return std::nullopt;
+            base_to_imu_rotation_ = base_imu.normalized();
+            cached_imu_frame_ = sample->header.frame_id;
+        } catch (const tf2::TransformException &) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                                 "IMU extrinsic TF unavailable; KISS uses LiDAR motion prediction");
+            return std::nullopt;
+        }
+    }
+    return (world_imu * base_to_imu_rotation_->inverse()).normalized();
 }
 
 void OdometryServer::PublishOdometry(const Sophus::SE3d &kiss_pose,
@@ -297,6 +421,8 @@ void OdometryServer::ResetService(
     initial_base_to_lidar_.reset();
     previous_leg_pose_.reset();
     previous_base_to_lidar_.reset();
+    previous_imu_base_orientation_.reset();
+    previous_scan_stamp_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
 
     RCLCPP_INFO(this->get_logger(), "KISS-ICP reset completed successfully");
 }

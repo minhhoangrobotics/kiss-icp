@@ -24,6 +24,9 @@
 #include "KissICP.hpp"
 
 #include <Eigen/Core>
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include <vector>
 
 #include "kiss_icp/core/Preprocessing.hpp"
@@ -53,6 +56,42 @@ KissICP::Vector3dVectorTuple KissICP::RegisterFrame(const std::vector<Eigen::Vec
                                                          initial_guess,  // initial_guess
                                                          3.0 * sigma,    // max_correspondence_dist
                                                          sigma);         // kernel
+
+    last_quality_ = RegistrationQuality{};
+    if (config_.quality_gate && !local_map_.Empty()) {
+        if (!new_pose.matrix().allFinite()) {
+            last_quality_.accepted = false;
+            last_quality_.inlier_ratio = 0.0;
+            last_quality_.rmse = std::numeric_limits<double>::infinity();
+            return {preprocessed_frame, source};
+        }
+        const auto difference = initial_guess.inverse() * new_pose;
+        last_quality_.translation_deviation = difference.translation().norm();
+        last_quality_.rotation_deviation = difference.so3().log().norm();
+        size_t sampled = 0, inliers = 0;
+        double error2 = 0.0;
+        const size_t stride = std::max<size_t>(1, source.size() / 300);
+        for (size_t i = 0; i < source.size(); i += stride) {
+            ++sampled;
+            const auto &point = source[i];
+            if (!point.allFinite()) continue;
+            const auto &[neighbor, distance] = local_map_.GetClosestNeighbor(new_pose * point);
+            (void)neighbor;
+            if (distance < config_.inlier_distance) {
+                ++inliers;
+                error2 += distance * distance;
+            }
+        }
+        last_quality_.inlier_ratio = sampled ? static_cast<double>(inliers) /
+                                               static_cast<double>(sampled) : 0.0;
+        last_quality_.rmse = inliers ? std::sqrt(error2 / static_cast<double>(inliers)) :
+                                      std::numeric_limits<double>::infinity();
+        last_quality_.accepted = last_quality_.inlier_ratio >= config_.min_inlier_ratio &&
+            last_quality_.rmse <= config_.max_inlier_rmse &&
+            (!pose_hint || (last_quality_.translation_deviation <= config_.max_prior_translation &&
+                            last_quality_.rotation_deviation <= config_.max_prior_rotation));
+        if (!last_quality_.accepted) return {preprocessed_frame, source};
+    }
 
     // Compute the difference between the prediction and the actual estimate
     const auto model_deviation = initial_guess.inverse() * new_pose;
@@ -84,6 +123,7 @@ void KissICP::Reset() {
     // Reset adaptive threshold (it will start fresh)
     adaptive_threshold_ =
         AdaptiveThreshold(config_.initial_threshold, config_.min_motion_th, config_.max_range);
+    last_quality_ = RegistrationQuality{};
 }
 
 }  // namespace kiss_icp::pipeline

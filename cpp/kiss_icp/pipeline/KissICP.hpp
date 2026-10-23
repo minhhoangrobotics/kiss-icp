@@ -52,6 +52,22 @@ struct KISSConfig {
 
     // Motion compensation
     bool deskew = true;
+
+    // Optional gate: a rejected scan must never contaminate the local voxel map.
+    bool quality_gate = false;
+    double min_inlier_ratio = 0.08;
+    double max_inlier_rmse = 0.25;
+    double inlier_distance = 0.30;
+    double max_prior_translation = 0.60;
+    double max_prior_rotation = 0.20;
+};
+
+struct RegistrationQuality {
+    bool accepted = true;
+    double inlier_ratio = 1.0;
+    double rmse = 0.0;
+    double translation_deviation = 0.0;
+    double rotation_deviation = 0.0;
 };
 
 class KissICP {
@@ -84,11 +100,14 @@ public:
 
     const Sophus::SE3d &delta() const { return last_delta_; }
     Sophus::SE3d &delta() { return last_delta_; }
+    bool registration_accepted() const { return last_quality_.accepted; }
+    const RegistrationQuality &registration_quality() const { return last_quality_; }
     void Reset();
 
 private:
     Sophus::SE3d last_pose_;
     Sophus::SE3d last_delta_;
+    RegistrationQuality last_quality_;
 
     // KISS-ICP pipeline modules
     KISSConfig config_;

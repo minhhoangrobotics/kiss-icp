@@ -29,10 +29,14 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/msg/imu.hpp>
 #include <std_msgs/msg/header.hpp>
+#include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/float32_multi_array.hpp>
 #include <std_srvs/srv/empty.hpp>
 #include <optional>
 #include <deque>
+#include <Eigen/Geometry>
 #include <string>
 #include <tf2_ros/buffer.hpp>
 #include <tf2_ros/transform_broadcaster.hpp>
@@ -58,6 +62,7 @@ private:
     void PublishOdometry(const Sophus::SE3d &kiss_pose, const std_msgs::msg::Header &header,
                          const Sophus::SE3d &base_to_lidar);
     std::optional<Sophus::SE3d> LegPoseAt(const rclcpp::Time &stamp) const;
+    std::optional<Eigen::Quaterniond> ImuBaseOrientationAt(const rclcpp::Time &stamp);
 
     /// Stream the debugging point clouds for visualization (if required)
     void PublishClouds(const std::vector<Eigen::Vector3d> &frame,
@@ -79,13 +84,22 @@ private:
     /// Data subscribers.
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr leg_odom_sub_;
+    rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
     std::deque<nav_msgs::msg::Odometry::ConstSharedPtr> recent_leg_poses_;
+    std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> recent_imu_;
     std::optional<Sophus::SE3d> previous_leg_pose_;
     std::optional<Sophus::SE3d> previous_base_to_lidar_;
+    std::optional<Eigen::Quaterniond> previous_imu_base_orientation_;
+    std::optional<Eigen::Quaterniond> base_to_imu_rotation_;
+    std::string cached_imu_frame_;
+    rclcpp::Time previous_scan_stamp_{0, 0, RCL_ROS_TIME};
     bool use_leg_prediction_ = false;
+    bool use_imu_prediction_ = false;
 
     /// Data publishers.
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_publisher_;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr registration_status_publisher_;
+    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr quality_publisher_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr frame_publisher_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr kpoints_publisher_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_publisher_;

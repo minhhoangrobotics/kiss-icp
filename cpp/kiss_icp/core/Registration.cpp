@@ -151,9 +151,11 @@ Sophus::SE3d Registration::AlignPointsToMap(const std::vector<Eigen::Vector3d> &
     for (int j = 0; j < max_num_iterations_; ++j) {
         // Equation (10)
         const auto correspondences = DataAssociation(source, voxel_map, max_distance);
+        if (correspondences.size() < 6) break;
         // Equation (11)
         const auto &[JTJ, JTr] = BuildLinearSystem(correspondences, kernel_scale);
         const Eigen::Vector6d dx = JTJ.ldlt().solve(-JTr);
+        if (!dx.allFinite()) break;
         const Sophus::SE3d estimation = Sophus::SE3d::exp(dx);
         // Equation (12)
         TransformPoints(estimation, source);
