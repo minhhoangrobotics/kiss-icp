@@ -63,11 +63,14 @@ KissICP::Vector3dVectorTuple KissICP::RegisterFrame(const std::vector<Eigen::Vec
             last_quality_.accepted = false;
             last_quality_.inlier_ratio = 0.0;
             last_quality_.rmse = std::numeric_limits<double>::infinity();
+            last_quality_.rejection_reason = "non-finite ICP pose";
             return {preprocessed_frame, source};
         }
         const auto difference = initial_guess.inverse() * new_pose;
         last_quality_.translation_deviation = difference.translation().norm();
         last_quality_.rotation_deviation = difference.so3().log().norm();
+        last_quality_.vertical_deviation =
+            std::abs(new_pose.translation().z() - initial_guess.translation().z());
         size_t sampled = 0, inliers = 0;
         double error2 = 0.0;
         const size_t stride = std::max<size_t>(1, source.size() / 300);
@@ -86,10 +89,18 @@ KissICP::Vector3dVectorTuple KissICP::RegisterFrame(const std::vector<Eigen::Vec
                                                static_cast<double>(sampled) : 0.0;
         last_quality_.rmse = inliers ? std::sqrt(error2 / static_cast<double>(inliers)) :
                                       std::numeric_limits<double>::infinity();
-        last_quality_.accepted = last_quality_.inlier_ratio >= config_.min_inlier_ratio &&
-            last_quality_.rmse <= config_.max_inlier_rmse &&
-            (!pose_hint || (last_quality_.translation_deviation <= config_.max_prior_translation &&
-                            last_quality_.rotation_deviation <= config_.max_prior_rotation));
+        if (last_quality_.inlier_ratio < config_.min_inlier_ratio) {
+            last_quality_.rejection_reason = "low local-map inlier ratio";
+        } else if (last_quality_.rmse > config_.max_inlier_rmse) {
+            last_quality_.rejection_reason = "high local-map RMSE";
+        } else if (pose_hint && last_quality_.translation_deviation > config_.max_prior_translation) {
+            last_quality_.rejection_reason = "translation disagrees with motion prediction";
+        } else if (pose_hint && last_quality_.rotation_deviation > config_.max_prior_rotation) {
+            last_quality_.rejection_reason = "rotation disagrees with IMU";
+        } else if (pose_hint && last_quality_.vertical_deviation > config_.max_prior_vertical) {
+            last_quality_.rejection_reason = "height disagrees with motion prediction";
+        }
+        last_quality_.accepted = last_quality_.rejection_reason.empty();
         if (!last_quality_.accepted) return {preprocessed_frame, source};
     }
 

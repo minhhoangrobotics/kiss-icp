@@ -41,3 +41,4 @@ kiss_icp_node:
       inlier_distance: 0.30     # Maximum distance defining a match, metres.
       max_prior_translation: 0.60 # Maximum ICP translation from motion seed, metres.
       max_prior_rotation: 0.20  # Maximum ICP rotation from motion seed, radians.
+      max_prior_vertical: 0.15  # Maximum vertical ICP correction before updating the local map.

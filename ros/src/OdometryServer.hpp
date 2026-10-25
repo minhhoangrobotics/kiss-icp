@@ -90,10 +90,14 @@ private:
     std::optional<Sophus::SE3d> previous_leg_pose_;
     std::optional<Sophus::SE3d> previous_base_to_lidar_;
     std::optional<Eigen::Quaterniond> previous_imu_base_orientation_;
+    std::optional<Eigen::Quaterniond> odom_from_imu_orientation_;
+    std::optional<double> odom_base_height_at_leg_anchor_;
+    std::optional<double> leg_height_anchor_;
     std::optional<Eigen::Quaterniond> base_to_imu_rotation_;
     std::string cached_imu_frame_;
     rclcpp::Time previous_scan_stamp_{0, 0, RCL_ROS_TIME};
     bool use_leg_prediction_ = false;
+    bool use_leg_height_constraint_ = false;
     bool use_imu_prediction_ = false;
 
     /// Data publishers.

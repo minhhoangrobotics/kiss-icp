@@ -24,6 +24,7 @@
 #include <Eigen/Core>
 #include <sophus/se3.hpp>
 #include <optional>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -60,6 +61,7 @@ struct KISSConfig {
     double inlier_distance = 0.30;
     double max_prior_translation = 0.60;
     double max_prior_rotation = 0.20;
+    double max_prior_vertical = 0.15;
 };
 
 struct RegistrationQuality {
@@ -68,6 +70,8 @@ struct RegistrationQuality {
     double rmse = 0.0;
     double translation_deviation = 0.0;
     double rotation_deviation = 0.0;
+    double vertical_deviation = 0.0;
+    std::string rejection_reason;
 };
 
 class KissICP {
