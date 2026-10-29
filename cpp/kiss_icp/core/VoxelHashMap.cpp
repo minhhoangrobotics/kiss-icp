@@ -27,6 +27,7 @@
 #include <array>
 #include <sophus/se3.hpp>
 #include <vector>
+#include <stdexcept>
 
 #include "VoxelUtils.hpp"
 
@@ -80,6 +81,42 @@ std::vector<Eigen::Vector3d> VoxelHashMap::Pointcloud() const {
     return points;
 }
 
+std::tuple<Eigen::Vector3d, double> VoxelHashMap::GetClosestNeighbor(
+    const Eigen::Vector3d& query, double max_distance) const {
+    const Voxel center = PointToVoxel(query, voxel_size_);
+    Eigen::Vector3d closest = Eigen::Vector3d::Zero();
+    double best2 = max_distance * max_distance;
+    const int limit = static_cast<int>(std::ceil(max_distance / voxel_size_));
+    // Expand voxel shells only until the nearest unsearched location is
+    // farther away than the best match. Usually one shell suffices; unlike
+    // a fixed 27-voxel search, this honors the ICP correspondence radius.
+    for (int ring = 0; ring <= limit; ++ring) {
+        for (int x = -ring; x <= ring; ++x) {
+            for (int y = -ring; y <= ring; ++y) {
+                for (int z = -ring; z <= ring; ++z) {
+                    if (std::max({std::abs(x),std::abs(y),std::abs(z)}) != ring) continue;
+                    const Voxel voxel = center + Voxel(x,y,z);
+                    const Eigen::Vector3d low = voxel.cast<double>() * voxel_size_;
+                    const Eigen::Vector3d high = low.array() + voxel_size_;
+                    const Eigen::Vector3d outside = (low-query).cwiseMax(query-high).cwiseMax(0.0);
+                    if (outside.squaredNorm() > best2) continue;
+                    const auto found = map_.find(voxel);
+                    if (found == map_.end()) continue;
+                    for (const auto& point : found.value()) {
+                        const double distance2 = (point-query).squaredNorm();
+                        if (distance2 < best2) { best2=distance2; closest=point; }
+                    }
+                }
+            }
+        }
+        const Eigen::Vector3d low = (center.array()-ring).matrix().cast<double>() * voxel_size_;
+        const Eigen::Vector3d high = (center.array()+ring+1).matrix().cast<double>() * voxel_size_;
+        const double unsearched = (query-low).cwiseMin(high-query).minCoeff();
+        if (unsearched * unsearched >= best2) break;
+    }
+    return {closest,std::sqrt(best2)};
+}
+
 void VoxelHashMap::Update(const std::vector<Eigen::Vector3d> &points,
                           const Eigen::Vector3d &origin) {
     AddPoints(points);
@@ -95,8 +132,48 @@ void VoxelHashMap::Update(const std::vector<Eigen::Vector3d> &points, const Soph
 }
 
 void VoxelHashMap::AddPoints(const std::vector<Eigen::Vector3d> &points) {
+    AddPoints(points, {});
+}
+
+void VoxelHashMap::Update(const std::vector<Eigen::Vector3d>& points,
+                          const Sophus::SE3d& pose,
+                          const std::vector<Eigen::Vector3d>& normals) {
+    if (points.size() != normals.size()) throw std::invalid_argument("point/normal size mismatch");
+    std::vector<Eigen::Vector3d> transformed(points.size()), rotated(normals.size());
+    for (size_t i = 0; i < points.size(); ++i) {
+        transformed[i] = pose * points[i];
+        rotated[i] = pose.so3() * normals[i];
+    }
+    AddPoints(transformed, rotated);
+    RemovePointsFarFromLocation(pose.translation());
+}
+
+std::pair<std::vector<Eigen::Vector3d>, std::vector<Eigen::Vector3d>> VoxelHashMap::Surfaces(
+    bool include_nonplanar) const {
+    std::vector<Eigen::Vector3d> points, normals;
+    points.reserve(map_.size());
+    normals.reserve(map_.size());
+    for (const auto& item : map_) {
+        const auto normal_it = normals_.find(item.first);
+        for (size_t i = 0; i < item.second.size(); ++i) {
+            Eigen::Vector3d normal = Eigen::Vector3d::Zero();
+            if (normal_it != normals_.end() && i < normal_it.value().size()) normal = normal_it.value()[i];
+            if (!include_nonplanar && normal.squaredNorm() < 0.5) continue;
+            points.push_back(item.second[i]);
+            normals.push_back(normal);
+        }
+    }
+    return {std::move(points), std::move(normals)};
+}
+
+void VoxelHashMap::AddPoints(const std::vector<Eigen::Vector3d> &points,
+                             const std::vector<Eigen::Vector3d> &normals) {
+    if (!normals.empty() && points.size() != normals.size())
+        throw std::invalid_argument("point/normal size mismatch");
     const double map_resolution = std::sqrt(voxel_size_ * voxel_size_ / max_points_per_voxel_);
-    std::for_each(points.cbegin(), points.cend(), [&](const auto &point) {
+    for (size_t i = 0; i < points.size(); ++i) {
+        const auto& point = points[i];
+        const Eigen::Vector3d normal = normals.empty() ? Eigen::Vector3d::Zero().eval() : normals[i];
         const auto voxel = PointToVoxel(point, voxel_size_);
         auto search = map_.find(voxel);
         if (search != map_.end()) {
@@ -106,7 +183,12 @@ void VoxelHashMap::AddPoints(const std::vector<Eigen::Vector3d> &points) {
                             [&](const auto &voxel_point) {
                                 return (voxel_point - point).norm() < map_resolution;
                             })) {
-                return;
+                continue;
+            }
+            if (!normals.empty()) {
+                auto& voxel_normals = normals_[voxel];
+                voxel_normals.resize(voxel_points.size(), Eigen::Vector3d::Zero());
+                voxel_normals.emplace_back(normal);
             }
             voxel_points.emplace_back(point);
         } else {
@@ -114,8 +196,9 @@ void VoxelHashMap::AddPoints(const std::vector<Eigen::Vector3d> &points) {
             voxel_points.reserve(max_points_per_voxel_);
             voxel_points.emplace_back(point);
             map_.insert({voxel, std::move(voxel_points)});
+            if (!normals.empty()) normals_[voxel] = {normal};
         }
-    });
+    }
 }
 
 void VoxelHashMap::RemovePointsFarFromLocation(const Eigen::Vector3d &origin) {
@@ -124,6 +207,7 @@ void VoxelHashMap::RemovePointsFarFromLocation(const Eigen::Vector3d &origin) {
         const auto &[voxel, voxel_points] = *it;
         const auto &pt = voxel_points.front();
         if ((pt - origin).squaredNorm() >= (max_distance2)) {
+            normals_.erase(voxel);
             it = map_.erase(it);
         } else {
             ++it;

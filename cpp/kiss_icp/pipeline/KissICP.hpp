@@ -50,6 +50,9 @@ struct KISSConfig {
     int max_num_iterations = 500;
     double convergence_criterion = 0.0001;
     int max_num_threads = 0;
+    bool fix_rotation_from_hint = false;
+    double rotation_prior_information = 0.0;
+    SurfaceOptions surface;
 
     // Motion compensation
     bool deskew = true;
@@ -61,7 +64,6 @@ struct KISSConfig {
     double inlier_distance = 0.30;
     double max_prior_translation = 0.60;
     double max_prior_rotation = 0.20;
-    double max_prior_vertical = 0.15;
 };
 
 struct RegistrationQuality {
@@ -91,7 +93,8 @@ public:
 public:
     Vector3dVectorTuple RegisterFrame(const std::vector<Eigen::Vector3d> &frame,
                                       const std::vector<double> &timestamps,
-                                      const std::optional<Sophus::SE3d> &pose_hint = std::nullopt);
+                                      const std::optional<Sophus::SE3d> &pose_hint = std::nullopt,
+                                      bool imu_orientation_valid = false);
     Vector3dVectorTuple Voxelize(const std::vector<Eigen::Vector3d> &frame) const;
 
     std::vector<Eigen::Vector3d> LocalMap() const { return local_map_.Pointcloud(); };
@@ -106,7 +109,9 @@ public:
     Sophus::SE3d &delta() { return last_delta_; }
     bool registration_accepted() const { return last_quality_.accepted; }
     const RegistrationQuality &registration_quality() const { return last_quality_; }
+    const SurfaceDiagnostics &surface_diagnostics() const { return registration_.surface_diagnostics; }
     void Reset();
+    void ResetToPose(const Sophus::SE3d &pose);
 
 private:
     Sophus::SE3d last_pose_;

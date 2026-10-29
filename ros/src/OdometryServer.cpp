@@ -35,6 +35,7 @@
 
 // KISS-ICP
 #include "kiss_icp/pipeline/KissICP.hpp"
+#include "kiss_icp/core/MotionPrediction.hpp"
 
 // ROS 2 headers
 #include <tf2_ros/static_transform_broadcaster.h>
@@ -69,6 +70,12 @@ OdometryServer::OdometryServer(const rclcpp::NodeOptions &options)
     kiss_icp_ = std::make_unique<kiss_icp::pipeline::KissICP>(config);
 
     // Initialize subscribers
+    // Run short sensor callbacks while the LiDAR callback performs ICP. The
+    // executable uses a two-thread executor, so scan-time IMU
+    // and leg samples can arrive before registration needs them.
+    sensor_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    rclcpp::SubscriptionOptions sensor_options;
+    sensor_options.callback_group = sensor_callback_group_;
     pointcloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
         // ICP can take longer than one scan period on the simulation host.
         // Keep the freshest scan instead of feeding stale scans to the graph.
@@ -81,26 +88,28 @@ OdometryServer::OdometryServer(const rclcpp::NodeOptions &options)
     if (use_leg_prediction_ || use_leg_height_constraint_) {
         leg_odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
             "leg_odometry_topic", 20, [this](const nav_msgs::msg::Odometry::ConstSharedPtr msg) {
+                std::lock_guard<std::mutex> lock(sensor_queue_mutex_);
                 recent_leg_poses_.push_back(msg);
                 const double newest = rclcpp::Time(msg->header.stamp).seconds();
                 while (!recent_leg_poses_.empty() &&
                        newest - rclcpp::Time(recent_leg_poses_.front()->header.stamp).seconds() > 3.0) {
                     recent_leg_poses_.pop_front();
                 }
-            });
+            }, sensor_options);
     }
     use_imu_prediction_ = declare_parameter<bool>("use_imu_prediction", false);
     if (use_imu_prediction_) {
         imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
             "imu_topic", rclcpp::SensorDataQoS().keep_last(50),
             [this](const sensor_msgs::msg::Imu::ConstSharedPtr msg) {
+                std::lock_guard<std::mutex> lock(sensor_queue_mutex_);
                 recent_imu_.push_back(msg);
                 const auto newest = rclcpp::Time(msg->header.stamp);
                 while (!recent_imu_.empty() &&
                        (newest - rclcpp::Time(recent_imu_.front()->header.stamp)).seconds() > 2.0) {
                     recent_imu_.pop_front();
                 }
-            });
+            }, sensor_options);
     }
     RCLCPP_INFO(get_logger(), "IMU rotation prediction for KISS ICP: %s",
                 use_imu_prediction_ ? "enabled" : "disabled");
@@ -176,17 +185,55 @@ void OdometryServer::initializeParameters(kiss_icp::pipeline::KISSConfig &config
     config.max_num_threads =
         declare_parameter<int>("registration.max_num_threads", config.max_num_threads);
     RCLCPP_INFO(this->get_logger(), "\tMax number of threads: %d", config.max_num_threads);
+    config.fix_rotation_from_hint = declare_parameter<bool>(
+        "registration.fix_rotation_from_imu", config.fix_rotation_from_hint);
+    config.rotation_prior_information = declare_parameter<double>(
+        "registration.rotation_prior_information", config.rotation_prior_information);
+    const auto metric = declare_parameter<std::string>("registration.metric", "point_to_point");
+    if (metric != "point_to_point" && metric != "point_to_point_exact" &&
+        metric != "point_to_plane" && metric != "generalized_icp" && metric != "hybrid")
+        throw std::invalid_argument("Unknown registration.metric");
+    config.surface.enabled = metric != "point_to_point";
+    const double regularization = declare_parameter<double>("registration.covariance_regularization", 0.01);
+    if (!std::isfinite(regularization) || regularization <= 0.0 || regularization > 1.0)
+        throw std::invalid_argument("registration.covariance_regularization must be in (0,1]");
+    config.surface.directional_hybrid = metric == "hybrid";
+    config.surface.covariance_regularization = (metric == "point_to_plane" || metric == "hybrid") ? 0.0 :
+                                               metric == "point_to_point_exact" ? 1.0 : regularization;
+    config.surface.translation_eigenvalue_ratio = declare_parameter<double>(
+        "registration.translation_eigenvalue_ratio", 0.02);
+    if (!std::isfinite(config.surface.translation_eigenvalue_ratio) ||
+        config.surface.translation_eigenvalue_ratio <= 0.0 || config.surface.translation_eigenvalue_ratio >= 1.0)
+        throw std::invalid_argument("registration.translation_eigenvalue_ratio must be in (0,1)");
+    config.surface.neighbors = declare_parameter<int>("registration.normal_neighbors", 10);
+    config.surface.radius = declare_parameter<double>("registration.normal_radius", 1.2);
+    config.surface.planarity_ratio = declare_parameter<double>("registration.planarity_ratio", 0.15);
+    config.surface.eigenvalue_ratio = declare_parameter<double>("registration.eigenvalue_ratio", 1e-4);
+    if (config.surface.neighbors < 3 || !std::isfinite(config.surface.radius) ||
+        config.surface.radius <= 0.0 || !std::isfinite(config.surface.planarity_ratio) ||
+        config.surface.planarity_ratio <= 0.0 || config.surface.planarity_ratio >= 1.0 ||
+        !std::isfinite(config.surface.eigenvalue_ratio) || config.surface.eigenvalue_ratio <= 0.0 ||
+        config.surface.eigenvalue_ratio >= 1.0)
+        throw std::invalid_argument("Invalid surface registration parameters");
+    RCLCPP_INFO(get_logger(), "KISS registration metric: %s; normal K=%d radius=%.2f m; rank ratio=%.1e; covariance epsilon=%.3g",
+                metric.c_str(), config.surface.neighbors, config.surface.radius,
+                config.surface.eigenvalue_ratio, config.surface.covariance_regularization);
+    if (!std::isfinite(config.rotation_prior_information) ||
+        config.rotation_prior_information < 0.0) {
+        throw std::invalid_argument("registration.rotation_prior_information must be finite and nonnegative");
+    }
     config.quality_gate = declare_parameter<bool>("quality.enabled", config.quality_gate);
     config.min_inlier_ratio = declare_parameter<double>("quality.min_inlier_ratio", config.min_inlier_ratio);
     config.max_inlier_rmse = declare_parameter<double>("quality.max_inlier_rmse", config.max_inlier_rmse);
     config.inlier_distance = declare_parameter<double>("quality.inlier_distance", config.inlier_distance);
     config.max_prior_translation = declare_parameter<double>("quality.max_prior_translation", config.max_prior_translation);
     config.max_prior_rotation = declare_parameter<double>("quality.max_prior_rotation", config.max_prior_rotation);
-    config.max_prior_vertical = declare_parameter<double>("quality.max_prior_vertical", config.max_prior_vertical);
+    reseed_after_rejection_seconds_ = declare_parameter<double>(
+        "quality.reseed_after_rejection_seconds", reseed_after_rejection_seconds_);
     if (config.min_inlier_ratio < 0.0 || config.min_inlier_ratio > 1.0 ||
         config.max_inlier_rmse <= 0.0 || config.inlier_distance <= 0.0 ||
         config.max_prior_translation <= 0.0 || config.max_prior_rotation <= 0.0 ||
-        config.max_prior_vertical <= 0.0) {
+        reseed_after_rejection_seconds_ <= 0.0) {
         throw std::invalid_argument("Invalid KISS quality gate parameters");
     }
     if (config.max_range < config.min_range) {
@@ -231,8 +278,15 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
     if (previous_base_to_lidar_) {
         // KISS predicts translation from its last accepted LiDAR motion. Leg
         // odometry can replace that translation, but IMU owns the rotation.
-        Sophus::SE3d base_delta = *previous_base_to_lidar_ * kiss_icp_->delta() *
-                                  base_to_lidar.inverse();
+        const double scan_interval =
+            (rclcpp::Time(msg->header.stamp) - previous_scan_stamp_).seconds();
+        // This delta was measured between the two previous accepted BASE
+        // poses, each using its own scan-time mount transform. The current
+        // mount must never be used to reconstruct a past motion increment.
+        Sophus::SE3d base_delta = previous_base_delta_;
+        if (previous_scan_interval_ > 0.0 && scan_interval > 0.0 && scan_interval < 0.5)
+            base_delta = Sophus::SE3d::exp(base_delta.log() *
+                                          (scan_interval / previous_scan_interval_));
         if (use_leg_prediction_ && leg_pose && previous_leg_pose_) {
             const auto leg_delta = previous_leg_pose_->inverse() * *leg_pose;
             if (leg_delta.translation().norm() < 0.8) {
@@ -252,19 +306,20 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
             }
         }
         if (base_delta.translation().allFinite() && base_delta.translation().norm() < 0.8) {
-            pose_hint = kiss_icp_->pose() * previous_base_to_lidar_->inverse() *
-                        base_delta * base_to_lidar;
+            std::optional<Sophus::SO3d> absolute_base_orientation;
             if (imu_orientation && odom_from_imu_orientation_) {
                 // An incremental IMU delta alone preserves any accumulated
                 // ICP roll/pitch error. Re-anchor every prediction to the
                 // absolute scan-time IMU attitude instead.
                 const Eigen::Quaterniond odom_base =
                     (*odom_from_imu_orientation_ * *imu_orientation).normalized();
-                pose_hint = Sophus::SE3d(
-                    Sophus::SO3d(
-                        (odom_base * base_to_lidar.so3().unit_quaternion()).normalized()),
-                    pose_hint->translation());
+                absolute_base_orientation = Sophus::SO3d(odom_base);
             }
+            // Compose the sensor lever arm AFTER choosing the current base
+            // attitude, so pure base rotation moves the LiDAR correctly.
+            pose_hint = kiss_icp::PredictLidarPose(kiss_icp_->pose(), *previous_base_to_lidar_,
+                                                  base_delta, base_to_lidar,
+                                                  absolute_base_orientation);
             if (use_leg_height_constraint_ && leg_pose &&
                 odom_base_height_at_leg_anchor_ && leg_height_anchor_) {
                 const Sophus::SE3d predicted_base = *pose_hint * base_to_lidar.inverse();
@@ -280,8 +335,43 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
     const auto timestamps = GetTimestamps(msg);
 
     // Register frame, main entry point to KISS-ICP pipeline
-    const auto &[frame, keypoints] = kiss_icp_->RegisterFrame(points, timestamps, pose_hint);
+    auto registration = kiss_icp_->RegisterFrame(points, timestamps, pose_hint,
+                                                 imu_orientation.has_value());
+    const auto &first_quality = kiss_icp_->registration_quality();
+    const double rejected_age = previous_scan_stamp_.nanoseconds() == 0 ? 0.0 :
+        (rclcpp::Time(msg->header.stamp) - previous_scan_stamp_).seconds();
+    if (!first_quality.accepted && use_leg_height_constraint_ && leg_pose && previous_leg_pose_ &&
+        previous_base_to_lidar_ && rejected_age >= reseed_after_rejection_seconds_) {
+        // Any sustained rejection leaves the local voxel map behind the robot.
+        // Rebuild it at the scan-time leg pose, retaining the KISS odom origin.
+        // A low inlier ratio is a reason to reseed, not a reason to wait forever.
+        const Sophus::SE3d leg_delta = previous_leg_pose_->inverse() * *leg_pose;
+        Sophus::SE3d predicted_base =
+            kiss_icp_->pose() * previous_base_to_lidar_->inverse() * leg_delta;
+        if (imu_orientation && odom_from_imu_orientation_) {
+            predicted_base = Sophus::SE3d(
+                Sophus::SO3d((*odom_from_imu_orientation_ * *imu_orientation).normalized()),
+                predicted_base.translation());
+        }
+        const Sophus::SE3d predicted_lidar = predicted_base * base_to_lidar;
+        RCLCPP_WARN(get_logger(),
+                    "Reseeding stale KISS voxel map after %.2f s of rejected scans (%s); "
+                    "leg delta %.2f m, previous RMSE %.3f m",
+                    rejected_age, first_quality.rejection_reason.c_str(),
+                    leg_delta.translation().norm(), first_quality.rmse);
+        kiss_icp_->ResetToPose(predicted_lidar);
+        registration = kiss_icp_->RegisterFrame(points, timestamps, predicted_lidar,
+                                                imu_orientation.has_value());
+    }
+    const auto &[frame, keypoints] = registration;
     const auto &quality = kiss_icp_->registration_quality();
+    const auto& surface = kiss_icp_->surface_diagnostics();
+    if (surface.correspondences > 0 || surface.fallback) {
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+            "KISS surface: matches=%zu rank=%d/6 metric_RMSE=%.4f m fallback=%s",
+            surface.correspondences, surface.rank, surface.residual_rmse,
+            surface.fallback ? "point_to_point" : "no");
+    }
     std_msgs::msg::Bool accepted_msg;
     accepted_msg.data = quality.accepted;
     registration_status_publisher_->publish(accepted_msg);
@@ -292,6 +382,13 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
                         static_cast<float>(quality.rotation_deviation)};
     quality_publisher_->publish(quality_msg);
     if (kiss_icp_->registration_accepted()) {
+      const Sophus::SE3d current_base_pose = kiss_icp_->pose() * base_to_lidar.inverse();
+      if (previous_base_pose_) {
+          previous_base_delta_ = previous_base_pose_->inverse() * current_base_pose;
+          previous_scan_interval_ =
+              (rclcpp::Time(msg->header.stamp) - previous_scan_stamp_).seconds();
+      }
+      previous_base_pose_ = current_base_pose;
       previous_scan_stamp_ = rclcpp::Time(msg->header.stamp);
       previous_base_to_lidar_ = base_to_lidar;
       previous_imu_base_orientation_ = imu_orientation;
@@ -334,30 +431,65 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
 }
 
 std::optional<Sophus::SE3d> OdometryServer::LegPoseAt(const rclcpp::Time &stamp) const {
-    double nearest_error = 0.2;
-    std::optional<Sophus::SE3d> result;
+    std::lock_guard<std::mutex> lock(sensor_queue_mutex_);
+    nav_msgs::msg::Odometry::ConstSharedPtr before, after;
     for (const auto &item : recent_leg_poses_) {
-        const double error = std::abs((rclcpp::Time(item->header.stamp) - stamp).seconds());
-        if (error >= nearest_error) continue;
+        if (rclcpp::Time(item->header.stamp) <= stamp) before = item;
+        else { after = item; break; }
+    }
+    auto valid_pose = [](const nav_msgs::msg::Odometry::ConstSharedPtr &item)
+        -> std::optional<Sophus::SE3d> {
+        if (!item) return std::nullopt;
         const auto &p = item->pose.pose.position;
         const auto &q = item->pose.pose.orientation;
         const Eigen::Quaterniond quaternion(q.w, q.x, q.y, q.z);
         if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) ||
-            !std::isfinite(quaternion.squaredNorm()) || quaternion.squaredNorm() < 0.5) continue;
-        nearest_error = error;
-        result = Sophus::SE3d(quaternion.normalized(), Eigen::Vector3d(p.x, p.y, p.z));
+            !std::isfinite(quaternion.squaredNorm()) || quaternion.squaredNorm() < 0.5)
+            return std::nullopt;
+        return Sophus::SE3d(quaternion.normalized(), Eigen::Vector3d(p.x, p.y, p.z));
+    };
+    if (before && after) {
+        const double dt = (rclcpp::Time(after->header.stamp) -
+                           rclcpp::Time(before->header.stamp)).seconds();
+        if (dt > 0.0 && dt < 0.04) {
+            const auto earlier = valid_pose(before), later = valid_pose(after);
+            if (earlier && later) {
+                const double u = (stamp - rclcpp::Time(before->header.stamp)).seconds() / dt;
+                const Eigen::Quaterniond rotation = earlier->so3().unit_quaternion().slerp(
+                    u, later->so3().unit_quaternion());
+                const Eigen::Vector3d translation =
+                    (1.0 - u) * earlier->translation() + u * later->translation();
+                return Sophus::SE3d(rotation.normalized(), translation);
+            }
+        }
     }
-    return result;
+    // A one-sided sample can still be useful during callback scheduling, but
+    // avoid extrapolating a fast turn from an old leg pose.
+    const auto nearest = before && after ?
+        ((stamp - rclcpp::Time(before->header.stamp)) <=
+         (rclcpp::Time(after->header.stamp) - stamp) ? before : after) :
+        (before ? before : after);
+    if (!nearest || std::abs((stamp - rclcpp::Time(nearest->header.stamp)).seconds()) > 0.03)
+        return std::nullopt;
+    return valid_pose(nearest);
 }
 
 std::optional<Eigen::Quaterniond> OdometryServer::ImuBaseOrientationAt(const rclcpp::Time &stamp) {
-    if (recent_imu_.empty()) return std::nullopt;
     sensor_msgs::msg::Imu::ConstSharedPtr before, after;
-    for (const auto &item : recent_imu_) {
-        if (rclcpp::Time(item->header.stamp) <= stamp) before = item;
-        else { after = item; break; }
+    {
+        std::lock_guard<std::mutex> lock(sensor_queue_mutex_);
+        if (recent_imu_.empty()) return std::nullopt;
+        for (const auto &item : recent_imu_) {
+            if (rclcpp::Time(item->header.stamp) <= stamp) before = item;
+            else { after = item; break; }
+        }
     }
-    const auto sample = before ? before : after;
+    auto sample = before ? before : after;
+    if (before && after &&
+        rclcpp::Time(after->header.stamp) - stamp <
+        stamp - rclcpp::Time(before->header.stamp)) {
+        sample = after;
+    }
     if (!sample || std::abs((stamp - rclcpp::Time(sample->header.stamp)).seconds()) > 0.04 ||
         sample->header.frame_id.empty()) return std::nullopt;
     auto from_msg = [](const sensor_msgs::msg::Imu::ConstSharedPtr &item) {
@@ -465,11 +597,19 @@ void OdometryServer::ResetService(
     initial_base_to_lidar_.reset();
     previous_leg_pose_.reset();
     previous_base_to_lidar_.reset();
+    previous_base_pose_.reset();
+    previous_base_delta_ = Sophus::SE3d();
+    previous_scan_interval_ = 0.0;
     previous_imu_base_orientation_.reset();
     odom_from_imu_orientation_.reset();
     odom_base_height_at_leg_anchor_.reset();
     leg_height_anchor_.reset();
     previous_scan_stamp_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+    {
+        std::lock_guard<std::mutex> lock(sensor_queue_mutex_);
+        recent_imu_.clear();
+        recent_leg_poses_.clear();
+    }
 
     RCLCPP_INFO(this->get_logger(), "KISS-ICP reset completed successfully");
 }

@@ -41,18 +41,27 @@ struct VoxelHashMap {
           max_distance_(max_distance),
           max_points_per_voxel_(max_points_per_voxel) {}
 
-    inline void Clear() { map_.clear(); }
+    inline void Clear() { map_.clear(); normals_.clear(); }
     inline bool Empty() const { return map_.empty(); }
     void Update(const std::vector<Eigen::Vector3d> &points, const Eigen::Vector3d &origin);
     void Update(const std::vector<Eigen::Vector3d> &points, const Sophus::SE3d &pose);
+    void Update(const std::vector<Eigen::Vector3d> &points, const Sophus::SE3d &pose,
+                const std::vector<Eigen::Vector3d> &normals);
     void AddPoints(const std::vector<Eigen::Vector3d> &points);
+    void AddPoints(const std::vector<Eigen::Vector3d> &points,
+                   const std::vector<Eigen::Vector3d> &normals);
     void RemovePointsFarFromLocation(const Eigen::Vector3d &origin);
     std::vector<Eigen::Vector3d> Pointcloud() const;
+    std::pair<std::vector<Eigen::Vector3d>, std::vector<Eigen::Vector3d>> Surfaces(
+        bool include_nonplanar = false) const;
     std::tuple<Eigen::Vector3d, double> GetClosestNeighbor(const Eigen::Vector3d &query) const;
+    std::tuple<Eigen::Vector3d, double> GetClosestNeighbor(
+        const Eigen::Vector3d& query, double max_distance) const;
 
     double voxel_size_;
     double max_distance_;
     unsigned int max_points_per_voxel_;
     tsl::robin_map<Voxel, std::vector<Eigen::Vector3d>> map_;
+    tsl::robin_map<Voxel, std::vector<Eigen::Vector3d>> normals_;
 };
 }  // namespace kiss_icp

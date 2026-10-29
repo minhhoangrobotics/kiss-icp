@@ -30,6 +30,24 @@
 
 namespace kiss_icp {
 
+struct SurfaceOptions {
+    bool enabled = false;
+    int neighbors = 10;
+    double radius = 1.2;
+    double planarity_ratio = 0.15;
+    double eigenvalue_ratio = 1e-4;
+    double covariance_regularization = 0.01;
+    bool directional_hybrid = false;
+    double translation_eigenvalue_ratio = 0.02;
+};
+
+struct SurfaceDiagnostics {
+    size_t correspondences = 0;
+    int rank = 0;
+    bool fallback = false;
+    double residual_rmse = 0.0;
+};
+
 struct Registration {
     explicit Registration(int max_num_iteration, double convergence_criterion, int max_num_threads);
 
@@ -37,7 +55,12 @@ struct Registration {
                                   const VoxelHashMap &voxel_map,
                                   const Sophus::SE3d &initial_guess,
                                   const double max_correspondence_distance,
-                                  const double kernel_scale);
+                                  const double kernel_scale,
+                                  bool fix_rotation = false,
+                                  double rotation_prior_information = 0.0,
+                                  const SurfaceOptions &surface = {});
+
+    SurfaceDiagnostics surface_diagnostics;
 
     int max_num_iterations_;
     double convergence_criterion_;

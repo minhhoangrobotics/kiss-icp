@@ -32,12 +32,14 @@
 #include "kiss_icp/core/Preprocessing.hpp"
 #include "kiss_icp/core/Registration.hpp"
 #include "kiss_icp/core/VoxelHashMap.hpp"
+#include "kiss_icp/core/Surface.hpp"
 
 namespace kiss_icp::pipeline {
 
 KissICP::Vector3dVectorTuple KissICP::RegisterFrame(const std::vector<Eigen::Vector3d> &frame,
                                                     const std::vector<double> &timestamps,
-                                                    const std::optional<Sophus::SE3d> &pose_hint) {
+                                                    const std::optional<Sophus::SE3d> &pose_hint,
+                                                    bool imu_orientation_valid) {
     // Preprocess the input cloud
     const auto &preprocessed_frame = preprocessor_.Preprocess(frame, timestamps, last_delta_);
 
@@ -51,13 +53,20 @@ KissICP::Vector3dVectorTuple KissICP::RegisterFrame(const std::vector<Eigen::Vec
     const auto initial_guess = pose_hint.value_or(last_pose_ * last_delta_);
 
     // Run ICP
-    const auto new_pose = registration_.AlignPointsToMap(source,         // frame
-                                                         local_map_,     // voxel_map
-                                                         initial_guess,  // initial_guess
-                                                         3.0 * sigma,    // max_correspondence_dist
-                                                         sigma);         // kernel
+    const bool imu_prior_valid = imu_orientation_valid && pose_hint.has_value();
+    const auto new_pose = registration_.AlignPointsToMap(
+        source, local_map_, initial_guess, 3.0 * sigma, sigma,
+        config_.fix_rotation_from_hint && imu_prior_valid,
+        imu_prior_valid ? config_.rotation_prior_information : 0.0, config_.surface);
 
     last_quality_ = RegistrationQuality{};
+    if (config_.surface.enabled && !local_map_.Empty() &&
+        !registration_.surface_diagnostics.fallback &&
+        registration_.surface_diagnostics.correspondences < 6) {
+        last_quality_.accepted = false;
+        last_quality_.rejection_reason = "insufficient surface correspondences";
+        return {preprocessed_frame, source};
+    }
     if (config_.quality_gate && !local_map_.Empty()) {
         if (!new_pose.matrix().allFinite()) {
             last_quality_.accepted = false;
@@ -97,8 +106,6 @@ KissICP::Vector3dVectorTuple KissICP::RegisterFrame(const std::vector<Eigen::Vec
             last_quality_.rejection_reason = "translation disagrees with motion prediction";
         } else if (pose_hint && last_quality_.rotation_deviation > config_.max_prior_rotation) {
             last_quality_.rejection_reason = "rotation disagrees with IMU";
-        } else if (pose_hint && last_quality_.vertical_deviation > config_.max_prior_vertical) {
-            last_quality_.rejection_reason = "height disagrees with motion prediction";
         }
         last_quality_.accepted = last_quality_.rejection_reason.empty();
         if (!last_quality_.accepted) return {preprocessed_frame, source};
@@ -109,7 +116,13 @@ KissICP::Vector3dVectorTuple KissICP::RegisterFrame(const std::vector<Eigen::Vec
 
     // Update step: threshold, local map, delta, and the last pose
     adaptive_threshold_.UpdateModelDeviation(model_deviation);
-    local_map_.Update(frame_downsample, new_pose);
+    if (config_.surface.enabled && config_.surface.covariance_regularization < 1.0) {
+        const auto normals = EstimateNormals(frame_downsample, config_.surface.neighbors,
+                                             config_.surface.radius, config_.surface.planarity_ratio);
+        local_map_.Update(frame_downsample, new_pose, normals);
+    } else {
+        local_map_.Update(frame_downsample, new_pose);
+    }
     last_delta_ = last_pose_.inverse() * new_pose;
     last_pose_ = new_pose;
 
@@ -135,6 +148,11 @@ void KissICP::Reset() {
     adaptive_threshold_ =
         AdaptiveThreshold(config_.initial_threshold, config_.min_motion_th, config_.max_range);
     last_quality_ = RegistrationQuality{};
+}
+
+void KissICP::ResetToPose(const Sophus::SE3d &pose) {
+    Reset();
+    last_pose_ = pose;
 }
 
 }  // namespace kiss_icp::pipeline

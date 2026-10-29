@@ -69,7 +69,8 @@ PYBIND11_MODULE(kiss_icp_pybind, m) {
                 self.Update(points, pose);
             },
             "points"_a, "pose"_a)
-        .def("_add_points", &VoxelHashMap::AddPoints, "points"_a)
+        .def("_add_points", py::overload_cast<const std::vector<Eigen::Vector3d>&>(
+                                 &VoxelHashMap::AddPoints), "points"_a)
         .def("_remove_far_away_points", &VoxelHashMap::RemovePointsFarFromLocation, "origin"_a)
         .def("_point_cloud", &VoxelHashMap::Pointcloud);
 

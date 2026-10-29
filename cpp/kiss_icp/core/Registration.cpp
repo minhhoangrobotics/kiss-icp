@@ -33,12 +33,14 @@
 #include <algorithm>
 #include <cmath>
 #include <numeric>
+#include <memory>
 #include <sophus/se3.hpp>
 #include <sophus/so3.hpp>
 #include <tuple>
 
 #include "VoxelHashMap.hpp"
 #include "VoxelUtils.hpp"
+#include "Surface.hpp"
 
 namespace Eigen {
 using Matrix6d = Eigen::Matrix<double, 6, 6>;
@@ -119,6 +121,162 @@ LinearSystem BuildLinearSystem(const Correspondences &correspondences, const dou
 
     return {JTJ, JTr};
 }
+
+Sophus::SE3d AlignSurfaces(const std::vector<Eigen::Vector3d>& frame,
+                           const std::vector<Eigen::Vector3d>& targets,
+                           const std::vector<Eigen::Vector3d>& normals,
+                           const Sophus::SE3d& initial_guess, double max_distance,
+                           double kernel_scale, bool fix_rotation, double rotation_information,
+                           int iterations, double convergence, const kiss_icp::SurfaceOptions& options,
+                           kiss_icp::SurfaceDiagnostics& diagnostics,
+                           const kiss_icp::VoxelHashMap* exact_map = nullptr) {
+    std::unique_ptr<kiss_icp::PointIndex> index;
+    if (options.covariance_regularization < 1.0) index = std::make_unique<kiss_icp::PointIndex>(targets);
+    const auto source_normals = options.covariance_regularization < 1.0 ?
+        kiss_icp::EstimateNormals(frame, options.neighbors, options.radius, options.planarity_ratio) :
+        std::vector<Eigen::Vector3d>{};
+    struct NormalSystem {
+        Eigen::Matrix6d H = Eigen::Matrix6d::Zero();
+        Eigen::Vector6d b = Eigen::Vector6d::Zero();
+        size_t count = 0;
+        double error2 = 0.0;
+        double point_information = 0.0;
+        Eigen::Vector3d point_gradient = Eigen::Vector3d::Zero();
+    };
+    Sophus::SE3d estimate = initial_guess;
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        auto system = tbb::parallel_reduce(
+            tbb::blocked_range<size_t>(0, frame.size(), 64), NormalSystem{},
+            [&](const tbb::blocked_range<size_t>& range, NormalSystem local) {
+                for (size_t i = range.begin(); i < range.end(); ++i) {
+                    const auto& point = frame[i];
+                    const Eigen::Vector3d lever = estimate.so3() * point;
+                    const Eigen::Vector3d source = lever + estimate.translation();
+                    Eigen::Vector3d target, normal = Eigen::Vector3d::Zero();
+                    if (options.directional_hybrid && exact_map) {
+                        const auto [point_match, point_distance] = exact_map->GetClosestNeighbor(source);
+                        if (point_distance < max_distance) {
+                            const auto point_residual = (source-point_match).eval();
+                            const double point_weight = square(kernel_scale) /
+                                square(kernel_scale+point_residual.squaredNorm());
+                            local.point_information += point_weight;
+                            local.point_gradient += point_weight * point_residual;
+                        }
+                    }
+                    if (options.covariance_regularization >= 1.0 && exact_map) {
+                        const auto [matched, distance] = exact_map->GetClosestNeighbor(source, max_distance);
+                        if (!(distance < max_distance)) continue;
+                        target = matched;
+                    } else {
+                        const auto near = index->Neighbors(source, 1, max_distance);
+                        if (near.empty()) continue;
+                        const size_t match = near.front().second;
+                        normal = normals[match];
+                        target = targets[match];
+                    }
+                    const Eigen::Vector3d residual = source - target;
+                    Eigen::Matrix3d information;
+                    if (options.covariance_regularization >= 1.0) {
+                        information.setIdentity();
+                    } else if (options.covariance_regularization > 0.0) {
+                        // GICP: a planar return has small normal variance and large
+                        // tangential variance. Combine BOTH measured covariances in
+                        // world coordinates. An edge/sparse return uses isotropic
+                        // uncertainty, retaining its information instead of dropping it.
+                        const double epsilon = options.covariance_regularization;
+                        const Eigen::Vector3d source_normal = estimate.so3() * source_normals[i];
+                        const Eigen::Matrix3d covariance = 2.0 * Eigen::Matrix3d::Identity() -
+                            (1.0-epsilon) * (normal*normal.transpose() +
+                                             source_normal*source_normal.transpose());
+                        information = 2.0 * epsilon * covariance.inverse();
+                    } else {
+                        information = normal * normal.transpose();
+                    }
+                    Eigen::Matrix3_6d J;
+                    J.leftCols<3>() = Eigen::Matrix3d::Identity();
+                    // Rotate about the sensor, not the arbitrary world origin.
+                    J.rightCols<3>() = -Sophus::SO3d::hat(lever);
+                    const double residual2 = residual.dot(information * residual);
+                    const double weight = square(square(kernel_scale) / (square(kernel_scale) + residual2));
+                    local.H.noalias() += weight * J.transpose() * information * J;
+                    local.b.noalias() += weight * J.transpose() * information * residual;
+                    local.error2 += residual2;
+                    ++local.count;
+                }
+                return local;
+            }, [](NormalSystem a, const NormalSystem& other) {
+                a.H += other.H;
+                a.b += other.b;
+                a.count += other.count;
+                a.error2 += other.error2;
+                a.point_information += other.point_information;
+                a.point_gradient += other.point_gradient;
+                return a;
+            });
+        auto& H = system.H;
+        auto& b = system.b;
+        const auto count = system.count;
+        diagnostics.correspondences = count;
+        diagnostics.residual_rmse = count ? std::sqrt(system.error2 / static_cast<double>(count)) : 0.0;
+        if (count < 6) break;
+        if (options.directional_hybrid && system.point_information > 0.0) {
+            // Plane normals constrain some translation directions much more
+            // strongly than others. Use the point associations from THIS scan
+            // in the weak subspace, rather than amplify noisy plane normals or
+            // freeze the robot there. Strong directions and rotation retain
+            // the surface metric. No cap on the estimated motion is applied.
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> geometry(H.topLeftCorner<3,3>());
+            if (geometry.info() == Eigen::Success) {
+                Eigen::Matrix3d strong = Eigen::Matrix3d::Zero();
+                // Compare against the second supported direction. A dense
+                // floor must not drown out the information from sparse walls.
+                // Require at least one effective unit-normal observation.
+                const double threshold = std::max(1.0, options.translation_eigenvalue_ratio *
+                                                       geometry.eigenvalues()[1]);
+                for (int k=0; k<3; ++k) {
+                    if (geometry.eigenvalues()[k] > std::max(1e-9,threshold))
+                        strong.noalias() += geometry.eigenvectors().col(k) *
+                                            geometry.eigenvectors().col(k).transpose();
+                }
+                const Eigen::Matrix3d weak = Eigen::Matrix3d::Identity()-strong;
+                Eigen::Matrix6d projection = Eigen::Matrix6d::Identity();
+                projection.topLeftCorner<3,3>() = strong;
+                H = (projection * H * projection).eval();
+                b = (projection * b).eval();
+                H.topLeftCorner<3,3>() += system.point_information * weak;
+                b.head<3>() += weak * system.point_gradient;
+            }
+        }
+        // The absolute scan-time IMU attitude is a measurement, not a clamp.
+        H.bottomRightCorner<3, 3>().diagonal().array() += rotation_information;
+        b.tail<3>() += rotation_information * (estimate.so3() * initial_guess.so3().inverse()).log();
+        if (fix_rotation) {
+            H.bottomRows<3>().setZero();
+            H.rightCols<3>().setZero();
+            b.tail<3>().setZero();
+        }
+        // Project onto measured directions. Unobservable directions receive
+        // zero correction and keep the motion prediction; never invert noise.
+        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eigen(H);
+        if (eigen.info() != Eigen::Success) break;
+        const double cutoff = std::max(1e-9, options.eigenvalue_ratio * eigen.eigenvalues().maxCoeff());
+        Eigen::Vector6d inverse = Eigen::Vector6d::Zero();
+        diagnostics.rank = 0;
+        for (int k = 0; k < 6; ++k) {
+            if (eigen.eigenvalues()[k] > cutoff) {
+                inverse[k] = 1.0 / eigen.eigenvalues()[k];
+                ++diagnostics.rank;
+            }
+        }
+        const Eigen::Vector6d dx = -eigen.eigenvectors() * inverse.asDiagonal() *
+                                   eigen.eigenvectors().transpose() * b;
+        if (!dx.allFinite()) break;
+        estimate = Sophus::SE3d(Sophus::SO3d::exp(dx.tail<3>()) * estimate.so3(),
+                                estimate.translation() + dx.head<3>());
+        if (dx.norm() < convergence) break;
+    }
+    return estimate;
+}
 }  // namespace
 
 namespace kiss_icp {
@@ -139,8 +297,31 @@ Sophus::SE3d Registration::AlignPointsToMap(const std::vector<Eigen::Vector3d> &
                                             const VoxelHashMap &voxel_map,
                                             const Sophus::SE3d &initial_guess,
                                             const double max_distance,
-                                            const double kernel_scale) {
+                                            const double kernel_scale,
+                                            bool fix_rotation,
+                                            double rotation_prior_information,
+                                            const SurfaceOptions& surface) {
+    surface_diagnostics = {};
     if (voxel_map.Empty()) return initial_guess;
+
+    if (surface.enabled) {
+        if (surface.covariance_regularization >= 1.0) {
+            return AlignSurfaces(frame, {}, {}, initial_guess, max_distance, kernel_scale,
+                                 fix_rotation, rotation_prior_information, max_num_iterations_,
+                                 convergence_criterion_, surface, surface_diagnostics, &voxel_map);
+        }
+        const auto [targets, normals] = voxel_map.Surfaces(surface.covariance_regularization > 0.0);
+        if (targets.size() >= 6) {
+            return AlignSurfaces(frame, targets, normals, initial_guess, max_distance,
+                                 kernel_scale, fix_rotation, rotation_prior_information,
+                                 max_num_iterations_, convergence_criterion_,
+                                 surface, surface_diagnostics,
+                                 surface.directional_hybrid ? &voxel_map : nullptr);
+        }
+        // A genuinely non-planar scene still supports the original KISS metric.
+        // Rank-deficient planar scenes do not take this fallback.
+        surface_diagnostics.fallback = true;
+    }
 
     // Equation (9)
     std::vector<Eigen::Vector3d> source = frame;
@@ -153,8 +334,27 @@ Sophus::SE3d Registration::AlignPointsToMap(const std::vector<Eigen::Vector3d> &
         const auto correspondences = DataAssociation(source, voxel_map, max_distance);
         if (correspondences.size() < 6) break;
         // Equation (11)
-        const auto &[JTJ, JTr] = BuildLinearSystem(correspondences, kernel_scale);
-        const Eigen::Vector6d dx = JTJ.ldlt().solve(-JTr);
+        auto [JTJ, JTr] = BuildLinearSystem(correspondences, kernel_scale);
+        if (rotation_prior_information > 0.0) {
+            // Use the scan-time IMU as an orientation measurement. Penalize
+            // deviation from it while allowing geometry to correct the pose.
+            // ICP uses left increments, so the prior residual is expressed in
+            // the same world tangent as the rotational Jacobian.
+            const Eigen::Vector3d rotation_error =
+                (T_icp.so3()).log();
+            JTJ.bottomRightCorner<3, 3>().diagonal().array() += rotation_prior_information;
+            JTr.tail<3>() += rotation_prior_information * rotation_error;
+        }
+        Eigen::Vector6d dx = Eigen::Vector6d::Zero();
+        if (fix_rotation) {
+            // The scan-time IMU already supplies orientation. Solving all six
+            // axes here lets small yaw corrections accumulate during turns,
+            // even when every scan has good overlap with the *drifting* local map.
+            // Solve translation only, with the same robust point weights.
+            dx.head<3>() = JTJ.topLeftCorner<3, 3>().ldlt().solve(-JTr.head<3>());
+        } else {
+            dx = JTJ.ldlt().solve(-JTr);
+        }
         if (!dx.allFinite()) break;
         const Sophus::SE3d estimation = Sophus::SE3d::exp(dx);
         // Equation (12)

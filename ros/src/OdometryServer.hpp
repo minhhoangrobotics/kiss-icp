@@ -36,6 +36,7 @@
 #include <std_srvs/srv/empty.hpp>
 #include <optional>
 #include <deque>
+#include <mutex>
 #include <Eigen/Geometry>
 #include <string>
 #include <tf2_ros/buffer.hpp>
@@ -85,10 +86,15 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr leg_odom_sub_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
+    rclcpp::CallbackGroup::SharedPtr sensor_callback_group_;
+    mutable std::mutex sensor_queue_mutex_;
     std::deque<nav_msgs::msg::Odometry::ConstSharedPtr> recent_leg_poses_;
     std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> recent_imu_;
     std::optional<Sophus::SE3d> previous_leg_pose_;
     std::optional<Sophus::SE3d> previous_base_to_lidar_;
+    std::optional<Sophus::SE3d> previous_base_pose_;
+    Sophus::SE3d previous_base_delta_;
+    double previous_scan_interval_ = 0.0;
     std::optional<Eigen::Quaterniond> previous_imu_base_orientation_;
     std::optional<Eigen::Quaterniond> odom_from_imu_orientation_;
     std::optional<double> odom_base_height_at_leg_anchor_;
@@ -98,6 +104,7 @@ private:
     rclcpp::Time previous_scan_stamp_{0, 0, RCL_ROS_TIME};
     bool use_leg_prediction_ = false;
     bool use_leg_height_constraint_ = false;
+    double reseed_after_rejection_seconds_ = 1.5;
     bool use_imu_prediction_ = false;
 
     /// Data publishers.

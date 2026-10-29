@@ -66,9 +66,25 @@ target_link_libraries(
           ${std_msgs_TARGETS}
           ${std_srvs_TARGETS})
 
-rclcpp_components_register_node(odometry_component PLUGIN "kiss_icp_ros::OdometryServer" EXECUTABLE kiss_icp_node)
+rclcpp_components_register_nodes(odometry_component "kiss_icp_ros::OdometryServer")
+
+# Two executor threads keep the high-rate IMU/leg callbacks responsive while
+# scan registration runs, without creating one thread per host CPU core.
+add_executable(kiss_icp_node src/main.cpp)
+target_compile_features(kiss_icp_node PRIVATE cxx_std_20)
+target_link_libraries(
+  kiss_icp_node
+  PRIVATE odometry_component
+          kiss_icp_pipeline
+          rclcpp::rclcpp
+          tf2_ros::tf2_ros
+          ${nav_msgs_TARGETS}
+          ${sensor_msgs_TARGETS}
+          ${std_msgs_TARGETS}
+          ${std_srvs_TARGETS})
 
 install(TARGETS odometry_component LIBRARY DESTINATION lib RUNTIME DESTINATION lib/${PROJECT_NAME})
+install(TARGETS kiss_icp_node RUNTIME DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY launch rviz config DESTINATION share/${PROJECT_NAME}/)
 
 ament_package()
