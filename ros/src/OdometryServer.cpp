@@ -31,6 +31,8 @@
 
 // KISS-ICP-ROS
 #include "OdometryServer.hpp"
+#include "kiss_icp/core/GravityFrame.hpp"
+#include "kiss_icp/core/InertialPoseUpdate.hpp"
 #include "Utils.hpp"
 
 // KISS-ICP
@@ -98,7 +100,15 @@ OdometryServer::OdometryServer(const rclcpp::NodeOptions &options)
             }, sensor_options);
     }
     use_imu_prediction_ = declare_parameter<bool>("use_imu_prediction", false);
+    gravity_align_output_ = declare_parameter<bool>("gravity_align_output",false);
+    if(gravity_align_output_ && !use_imu_prediction_)
+        throw std::invalid_argument("gravity_align_output requires use_imu_prediction");
+    if(gravity_align_output_ && base_frame_.empty())
+        throw std::invalid_argument("gravity_align_output requires an explicit base_frame for IMU extrinsics");
     use_inertial_translation_ = declare_parameter<bool>("inertial_prediction.enabled", false);
+    imu_wait_timeout_ = declare_parameter<double>("inertial_prediction.imu_wait_timeout", 0.06);
+    if (!std::isfinite(imu_wait_timeout_) || imu_wait_timeout_ < 0.0)
+        throw std::invalid_argument("inertial_prediction.imu_wait_timeout must be finite and nonnegative");
     inertial_prediction_.acceleration_noise = declare_parameter<double>("inertial_prediction.acceleration_noise", 0.2);
     inertial_prediction_.bias_walk = declare_parameter<double>("inertial_prediction.bias_walk", 0.005);
     inertial_prediction_.position_noise = declare_parameter<double>("inertial_prediction.position_noise", 0.02);
@@ -112,6 +122,9 @@ OdometryServer::OdometryServer(const rclcpp::NodeOptions &options)
         throw std::invalid_argument("inertial_prediction requires use_imu_prediction");
     RCLCPP_INFO(get_logger(), "Inertial translation prediction: %s; LiDAR updates observable directions only",
                 use_inertial_translation_ ? "enabled" : "disabled");
+    if(use_inertial_translation_)
+        RCLCPP_INFO(get_logger(),"Inertial/LiDAR update: independent plane likelihood, propagated covariance prior; scan-time IMU wait %.0f ms",
+                    1000.0*imu_wait_timeout_);
     if (use_imu_prediction_) {
         imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
             "imu_topic", rclcpp::SensorDataQoS().keep_last(50),
@@ -123,6 +136,7 @@ OdometryServer::OdometryServer(const rclcpp::NodeOptions &options)
                        (newest - rclcpp::Time(recent_imu_.front()->header.stamp)).seconds() > 2.0) {
                     recent_imu_.pop_front();
                 }
+                imu_arrived_.notify_all();
             }, sensor_options);
     }
     RCLCPP_INFO(get_logger(), "IMU rotation prediction for KISS ICP: %s",
@@ -278,11 +292,34 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
                              "No leg odometry near LiDAR timestamp; KISS uses its own motion estimate");
     }
+    if (use_inertial_translation_) {
+        // Sensor callbacks have their own executor group/thread. Wait for the
+        // upper interpolation sample, releasing the queue mutex while waiting.
+        // A late sample is not missing motion and must never reset velocity.
+        const rclcpp::Time scan_stamp(msg->header.stamp);
+        std::unique_lock<std::mutex> lock(sensor_queue_mutex_);
+        const bool covered=imu_arrived_.wait_for(lock,std::chrono::duration<double>(imu_wait_timeout_),[&] {
+            return !recent_imu_.empty() &&
+                   rclcpp::Time(recent_imu_.front()->header.stamp)<=scan_stamp &&
+                   rclcpp::Time(recent_imu_.back()->header.stamp)>=scan_stamp;
+        });
+        if (!covered) {
+            RCLCPP_WARN_THROTTLE(get_logger(),*get_clock(),2000,
+                "Skipping LiDAR update: scan-time IMU bracket unavailable after %.0f ms; preserving inertial state",
+                1000.0*imu_wait_timeout_);
+            return;
+        }
+    }
     const auto imu_orientation = use_imu_prediction_ ? ImuBaseOrientationAt(rclcpp::Time(msg->header.stamp)) :
                                                         std::optional<Eigen::Quaterniond>{};
     if (use_imu_prediction_ && !imu_orientation) {
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
                              "No scan-time IMU attitude within 40 ms; KISS cannot anchor tilt for this cloud");
+    }
+    if(gravity_align_output_ && !output_from_internal_ && !imu_orientation) {
+        RCLCPP_WARN_THROTTLE(get_logger(),*get_clock(),2000,
+                            "Waiting for first scan-time IMU attitude before initializing gravity-aligned odometry");
+        return;
     }
     if (use_leg_height_constraint_ && !leg_pose) {
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
@@ -377,10 +414,21 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
     }
     const auto points = PointCloud2ToEigen(msg);
     const auto timestamps = GetTimestamps(msg);
+    auto posterior=inertial_prediction_;
+    std::function<Sophus::SE3d(const Sophus::SE3d&,const kiss_icp::SurfaceDiagnostics&)> state_update;
+    if(inertial_translation_valid) {
+        state_update=[&](const Sophus::SE3d& measured,const kiss_icp::SurfaceDiagnostics& geometry) {
+            return kiss_icp::FuseInertialLidarLikelihood(posterior,measured,base_to_lidar,
+                                                       base_to_imu_translation_,geometry);
+        };
+    }
 
     // Register frame, main entry point to KISS-ICP pipeline
+    const std::optional<Eigen::Matrix3d> inertial_covariance=inertial_translation_valid ?
+        std::optional<Eigen::Matrix3d>(inertial_prediction_.covariance().topLeftCorner<3,3>()) : std::nullopt;
     auto registration = kiss_icp_->RegisterFrame(points, timestamps, pose_hint,
-                                                 imu_orientation.has_value(), inertial_translation_valid);
+                                                 imu_orientation.has_value(), inertial_translation_valid,state_update,
+                                                 inertial_covariance);
     const auto &first_quality = kiss_icp_->registration_quality();
     const double rejected_age = previous_scan_stamp_.nanoseconds() == 0 ? 0.0 :
         (rclcpp::Time(msg->header.stamp) - previous_scan_stamp_).seconds();
@@ -450,7 +498,7 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
           const Eigen::Vector3d imu_position=current_base_pose.translation()+
                                              current_base_pose.so3()*base_to_imu_translation_;
           if (inertial_translation_valid)
-              inertial_prediction_.Correct(imu_position, surface.observable_translation);
+              inertial_prediction_=posterior;
           else
               inertial_prediction_.Initialize(rclcpp::Time(msg->header.stamp).seconds(),imu_position,
                   *odom_from_imu_orientation_ * Eigen::Vector3d(0,0,-gravity_magnitude_));
@@ -489,7 +537,7 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
     const Sophus::SE3d kiss_pose = kiss_icp_->pose();
 
     // Spit the current estimated pose to ROS msgs handling the desired target frame
-    PublishOdometry(kiss_pose, msg->header, base_to_lidar);
+    PublishOdometry(kiss_pose, msg->header, base_to_lidar, imu_orientation);
     // Publishing these clouds is a bit costly, so do it only if we are debugging
     if (publish_debug_clouds_) {
         PublishClouds(frame, keypoints, msg->header);
@@ -596,16 +644,21 @@ std::optional<Eigen::Quaterniond> OdometryServer::ImuBaseOrientationAt(const rcl
 
 void OdometryServer::PublishOdometry(const Sophus::SE3d &kiss_pose,
                                      const std_msgs::msg::Header &header,
-                                     const Sophus::SE3d &base_to_lidar) {
+                                     const Sophus::SE3d &base_to_lidar,
+                                     const std::optional<Eigen::Quaterniond>& imu_orientation) {
     // If necessary, transform the ego-centric pose to the specified base_link/base_footprint frame
     const auto cloud_frame_id = header.frame_id;
     const auto egocentric_estimation = (base_frame_.empty() || base_frame_ == cloud_frame_id);
     const auto moving_frame = egocentric_estimation ? cloud_frame_id : base_frame_;
-    Sophus::SE3d pose = kiss_pose;
-    if (!egocentric_estimation) {
-        if (!initial_base_to_lidar_) initial_base_to_lidar_ = base_to_lidar;
-        pose = *initial_base_to_lidar_ * kiss_pose * base_to_lidar.inverse();
+    const Sophus::SE3d internal_from_base=egocentric_estimation?kiss_pose:kiss_pose*base_to_lidar.inverse();
+    if(!output_from_internal_) {
+        if(gravity_align_output_) {
+            output_from_internal_=kiss_icp::GravityAlignedOdometryFrame(internal_from_base,*imu_orientation);
+            RCLCPP_INFO(get_logger(),"Initialized gravity-aligned odometry output at scan stamp %.9f",
+                        rclcpp::Time(header.stamp).seconds());
+        } else output_from_internal_=egocentric_estimation?Sophus::SE3d():base_to_lidar;
     }
+    const Sophus::SE3d pose=*output_from_internal_*internal_from_base;
 
     // Broadcast the tf ---
     if (publish_odom_tf_) {
@@ -650,7 +703,8 @@ void OdometryServer::PublishClouds(const std::vector<Eigen::Vector3d> &frame,
     const size_t limit = static_cast<size_t>(std::max(1, debug_map_max_points_));
     const size_t stride = std::max<size_t>(1, (kiss_map.size() + limit - 1) / limit);
     display_map.reserve(std::min(kiss_map.size(), limit));
-    for (size_t i = 0; i < kiss_map.size(); i += stride) display_map.push_back(kiss_map[i]);
+    for (size_t i = 0; i < kiss_map.size(); i += stride)
+        display_map.push_back(output_from_internal_?*output_from_internal_*kiss_map[i]:kiss_map[i]);
     auto local_map_header = header;
     local_map_header.frame_id = lidar_odom_frame_;
     map_publisher_->publish(std::move(EigenToPointCloud2(display_map, local_map_header)));
@@ -662,7 +716,7 @@ void OdometryServer::ResetService(
 
     // Reset the KISS-ICP pipeline
     kiss_icp_->Reset();
-    initial_base_to_lidar_.reset();
+    output_from_internal_.reset();
     previous_leg_pose_.reset();
     previous_base_to_lidar_.reset();
     previous_base_pose_.reset();

@@ -27,6 +27,7 @@
 #include <string>
 #include <tuple>
 #include <vector>
+#include <functional>
 
 #include "kiss_icp/core/Preprocessing.hpp"
 #include "kiss_icp/core/Registration.hpp"
@@ -95,7 +96,9 @@ public:
                                       const std::vector<double> &timestamps,
                                       const std::optional<Sophus::SE3d> &pose_hint = std::nullopt,
                                       bool imu_orientation_valid = false,
-                                      bool inertial_translation_valid = false);
+                                      bool inertial_translation_valid = false,
+                                      const std::function<Sophus::SE3d(const Sophus::SE3d&,const SurfaceDiagnostics&)>& state_update = {},
+                                      const std::optional<Eigen::Matrix3d>& inertial_covariance = std::nullopt);
     Vector3dVectorTuple Voxelize(const std::vector<Eigen::Vector3d> &frame) const;
 
     std::vector<Eigen::Vector3d> LocalMap() const { return local_map_.Pointcloud(); };

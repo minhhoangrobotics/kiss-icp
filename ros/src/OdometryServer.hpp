@@ -38,6 +38,7 @@
 #include <optional>
 #include <deque>
 #include <mutex>
+#include <condition_variable>
 #include <Eigen/Geometry>
 #include <string>
 #include <tf2_ros/buffer.hpp>
@@ -62,7 +63,8 @@ private:
 
     /// Stream the estimated pose to ROS
     void PublishOdometry(const Sophus::SE3d &kiss_pose, const std_msgs::msg::Header &header,
-                         const Sophus::SE3d &base_to_lidar);
+                         const Sophus::SE3d &base_to_lidar,
+                         const std::optional<Eigen::Quaterniond>& imu_orientation);
     std::optional<Sophus::SE3d> LegPoseAt(const rclcpp::Time &stamp) const;
     std::optional<Eigen::Quaterniond> ImuBaseOrientationAt(const rclcpp::Time &stamp);
 
@@ -89,6 +91,8 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
     rclcpp::CallbackGroup::SharedPtr sensor_callback_group_;
     mutable std::mutex sensor_queue_mutex_;
+    std::condition_variable imu_arrived_;
+    double imu_wait_timeout_ = 0.06;
     std::deque<nav_msgs::msg::Odometry::ConstSharedPtr> recent_leg_poses_;
     std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> recent_imu_;
     std::optional<Sophus::SE3d> previous_leg_pose_;
@@ -130,7 +134,8 @@ private:
     /// Global/map coordinate frame.
     std::string lidar_odom_frame_{"odom_lidar"};
     std::string base_frame_{};
-    std::optional<Sophus::SE3d> initial_base_to_lidar_;
+    std::optional<Sophus::SE3d> output_from_internal_;
+    bool gravity_align_output_ = false;
 
     /// Covariance diagonal
     double position_covariance_;

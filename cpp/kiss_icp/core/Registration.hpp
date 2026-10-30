@@ -40,6 +40,8 @@ struct SurfaceOptions {
     bool directional_hybrid = false;
     double translation_eigenvalue_ratio = 0.02;
     bool inertial_translation_valid = false;
+    bool covariance_inertial_prior = true;
+    Eigen::Matrix3d inertial_information = Eigen::Matrix3d::Zero();
 };
 
 struct SurfaceDiagnostics {
@@ -48,6 +50,13 @@ struct SurfaceDiagnostics {
     bool fallback = false;
     double residual_rmse = 0.0;
     Eigen::Matrix3d observable_translation = Eigen::Matrix3d::Identity();
+    bool has_translation_measurement = false;
+    double translation_noise_variance = 1.0;
+    Eigen::Matrix3d translation_information = Eigen::Matrix3d::Zero();
+    Eigen::Matrix3d translation_rotation_information = Eigen::Matrix3d::Zero();
+    Eigen::Vector3d translation_gradient = Eigen::Vector3d::Zero();
+    Eigen::Vector3d linearization_position = Eigen::Vector3d::Zero();
+    Sophus::SO3d linearization_rotation;
 };
 
 struct Registration {

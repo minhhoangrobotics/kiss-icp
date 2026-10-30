@@ -40,7 +40,9 @@ KissICP::Vector3dVectorTuple KissICP::RegisterFrame(const std::vector<Eigen::Vec
                                                     const std::vector<double> &timestamps,
                                                     const std::optional<Sophus::SE3d> &pose_hint,
                                                     bool imu_orientation_valid,
-                                                    bool inertial_translation_valid) {
+                                                    bool inertial_translation_valid,
+                                                    const std::function<Sophus::SE3d(const Sophus::SE3d&,const SurfaceDiagnostics&)>& state_update,
+                                                    const std::optional<Eigen::Matrix3d>& inertial_covariance) {
     // Preprocess the input cloud
     const auto &preprocessed_frame = preprocessor_.Preprocess(frame, timestamps, last_delta_);
 
@@ -57,10 +59,15 @@ KissICP::Vector3dVectorTuple KissICP::RegisterFrame(const std::vector<Eigen::Vec
     const bool imu_prior_valid = imu_orientation_valid && pose_hint.has_value();
     auto surface = config_.surface;
     surface.inertial_translation_valid = inertial_translation_valid && imu_prior_valid;
-    const auto new_pose = registration_.AlignPointsToMap(
+    if(inertial_covariance && surface.inertial_translation_valid) {
+        surface.inertial_information=config_.voxel_size*config_.voxel_size*
+            inertial_covariance->ldlt().solve(Eigen::Matrix3d::Identity());
+    }
+    auto new_pose = registration_.AlignPointsToMap(
         source, local_map_, initial_guess, 3.0 * sigma, sigma,
         config_.fix_rotation_from_hint && imu_prior_valid,
         imu_prior_valid ? config_.rotation_prior_information : 0.0, surface);
+    registration_.surface_diagnostics.translation_noise_variance=config_.voxel_size*config_.voxel_size;
 
     last_quality_ = RegistrationQuality{};
     if (config_.surface.enabled && !local_map_.Empty() &&
@@ -70,19 +77,19 @@ KissICP::Vector3dVectorTuple KissICP::RegisterFrame(const std::vector<Eigen::Vec
         last_quality_.rejection_reason = "insufficient surface correspondences";
         return {preprocessed_frame, source};
     }
-    if (config_.quality_gate && !local_map_.Empty()) {
-        if (!new_pose.matrix().allFinite()) {
-            last_quality_.accepted = false;
-            last_quality_.inlier_ratio = 0.0;
-            last_quality_.rmse = std::numeric_limits<double>::infinity();
-            last_quality_.rejection_reason = "non-finite ICP pose";
-            return {preprocessed_frame, source};
+    auto validate_pose=[&](const Sophus::SE3d& candidate) {
+        last_quality_=RegistrationQuality{};
+        if(!candidate.matrix().allFinite()) {
+            last_quality_.accepted=false;last_quality_.inlier_ratio=0;
+            last_quality_.rmse=std::numeric_limits<double>::infinity();
+            last_quality_.rejection_reason="non-finite accepted pose";return false;
         }
-        const auto difference = initial_guess.inverse() * new_pose;
+        if(!config_.quality_gate || local_map_.Empty())return true;
+        const auto difference = initial_guess.inverse() * candidate;
         last_quality_.translation_deviation = difference.translation().norm();
         last_quality_.rotation_deviation = difference.so3().log().norm();
         last_quality_.vertical_deviation =
-            std::abs(new_pose.translation().z() - initial_guess.translation().z());
+            std::abs(candidate.translation().z() - initial_guess.translation().z());
         size_t sampled = 0, inliers = 0;
         double error2 = 0.0;
         const size_t stride = std::max<size_t>(1, source.size() / 300);
@@ -90,7 +97,7 @@ KissICP::Vector3dVectorTuple KissICP::RegisterFrame(const std::vector<Eigen::Vec
             ++sampled;
             const auto &point = source[i];
             if (!point.allFinite()) continue;
-            const auto &[neighbor, distance] = local_map_.GetClosestNeighbor(new_pose * point);
+            const auto &[neighbor, distance] = local_map_.GetClosestNeighbor(candidate * point);
             (void)neighbor;
             if (distance < config_.inlier_distance) {
                 ++inliers;
@@ -111,7 +118,14 @@ KissICP::Vector3dVectorTuple KissICP::RegisterFrame(const std::vector<Eigen::Vec
             last_quality_.rejection_reason = "rotation disagrees with IMU";
         }
         last_quality_.accepted = last_quality_.rejection_reason.empty();
-        if (!last_quality_.accepted) return {preprocessed_frame, source};
+        return last_quality_.accepted;
+    };
+    // Validate the actual LiDAR measurement before it can update velocity or
+    // bias. A small Kalman gain must not conceal an invalid ICP measurement.
+    if(!validate_pose(new_pose))return {preprocessed_frame,source};
+    if(state_update) {
+        new_pose=state_update(new_pose,registration_.surface_diagnostics);
+        if(!validate_pose(new_pose))return {preprocessed_frame,source};
     }
 
     // Compute the difference between the prediction and the actual estimate

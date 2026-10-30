@@ -3,6 +3,7 @@
 #include <Eigen/Core>
 #include <Eigen/Cholesky>
 #include <Eigen/Geometry>
+#include <Eigen/Eigenvalues>
 #include <algorithm>
 #include <vector>
 
@@ -90,6 +91,27 @@ public:
         const Eigen::Matrix3d S=H*covariance_*H.transpose()+R;
         const Eigen::Matrix<double,9,3> K=covariance_*H.transpose()*S.ldlt().solve(Eigen::Matrix3d::Identity());
         const Eigen::Vector3d residual=observable*(imu_position-state_.head<3>());
+        state_+=K*residual;
+        const Eigen::Matrix<double,9,9> A=Eigen::Matrix<double,9,9>::Identity()-K*H;
+        covariance_=(A*covariance_*A.transpose()+K*R*K.transpose()).eval();
+        covariance_=(0.5*(covariance_+covariance_.transpose())).eval();
+    }
+
+    // Plane likelihood in independent eigen-directions. Sparse but nonzero
+    // geometric information receives larger noise, not a binary rejection.
+    void CorrectInformation(const Eigen::Vector3d& imu_position,
+                            const Eigen::Matrix3d& information) {
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eigen(information);
+        if(eigen.info()!=Eigen::Success)return;
+        Eigen::Matrix<double,3,9> H=Eigen::Matrix<double,3,9>::Zero();
+        Eigen::Matrix3d R=Eigen::Matrix3d::Identity();
+        for(int k=0;k<3;++k)if(eigen.eigenvalues()[k]>1e-9) {
+            H.block<1,3>(k,0)=eigen.eigenvectors().col(k).transpose();
+            R(k,k)=position_noise*position_noise+1.0/eigen.eigenvalues()[k];
+        }
+        const Eigen::Matrix3d S=H*covariance_*H.transpose()+R;
+        const Eigen::Matrix<double,9,3> K=covariance_*H.transpose()*S.ldlt().solve(Eigen::Matrix3d::Identity());
+        const Eigen::Vector3d residual=H.leftCols<3>()*(imu_position-state_.head<3>());
         state_+=K*residual;
         const Eigen::Matrix<double,9,9> A=Eigen::Matrix<double,9,9>::Identity()-K*H;
         covariance_=(A*covariance_*A.transpose()+K*R*K.transpose()).eval();

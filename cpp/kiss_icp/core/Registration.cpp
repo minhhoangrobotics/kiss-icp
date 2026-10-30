@@ -219,6 +219,15 @@ Sophus::SE3d AlignSurfaces(const std::vector<Eigen::Vector3d>& frame,
         diagnostics.correspondences = count;
         diagnostics.residual_rmse = count ? std::sqrt(system.error2 / static_cast<double>(count)) : 0.0;
         if (count < 6) break;
+        // Keep the independent LiDAR likelihood before adding any prediction
+        // prior. The state filter must not fuse its own prior a second time.
+        diagnostics.has_translation_measurement = options.inertial_translation_valid &&
+            options.covariance_inertial_prior && options.inertial_information.trace()>0.0;
+        diagnostics.translation_information=H.topLeftCorner<3,3>();
+        diagnostics.translation_rotation_information=H.topRightCorner<3,3>();
+        diagnostics.translation_gradient=b.head<3>();
+        diagnostics.linearization_position=estimate.translation();
+        diagnostics.linearization_rotation=estimate.so3();
         if (options.directional_hybrid && (system.point_information > 0.0 || options.inertial_translation_valid)) {
             // Plane normals constrain some translation directions much more
             // strongly than others. Use an independent inertial prior when
@@ -242,9 +251,16 @@ Sophus::SE3d AlignSurfaces(const std::vector<Eigen::Vector3d>& frame,
                 diagnostics.observable_translation = strong;
                 Eigen::Matrix6d projection = Eigen::Matrix6d::Identity();
                 projection.topLeftCorner<3,3>() = strong;
-                H = (projection * H * projection).eval();
-                b = (projection * b).eval();
-                if (options.inertial_translation_valid) {
+                if (diagnostics.has_translation_measurement) {
+                    // Weak geometry still contains measurements. Retain its
+                    // Hessian/cross terms and weight the independent prior by
+                    // its propagated covariance, rather than by point count.
+                    const Eigen::Matrix3d prior=weak*options.inertial_information*weak;
+                    H.topLeftCorner<3,3>()+=prior;
+                    b.head<3>()+=prior*(estimate.translation()-initial_guess.translation());
+                } else if (options.inertial_translation_valid) {
+                    H = (projection * H * projection).eval();
+                    b = (projection * b).eval();
                     // No geometric measurement exists along this subspace.
                     // Keep the independently IMU-propagated translation prior;
                     // discrete floor samples must not invent velocity there.
@@ -252,6 +268,8 @@ Sophus::SE3d AlignSurfaces(const std::vector<Eigen::Vector3d>& frame,
                     H.topLeftCorner<3,3>() += information * weak;
                     b.head<3>() += information * weak * (estimate.translation()-initial_guess.translation());
                 } else {
+                    H = (projection * H * projection).eval();
+                    b = (projection * b).eval();
                     H.topLeftCorner<3,3>() += system.point_information * weak;
                     b.head<3>() += weak * system.point_gradient;
                 }
