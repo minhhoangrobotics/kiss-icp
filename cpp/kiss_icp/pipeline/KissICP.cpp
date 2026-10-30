@@ -39,7 +39,8 @@ namespace kiss_icp::pipeline {
 KissICP::Vector3dVectorTuple KissICP::RegisterFrame(const std::vector<Eigen::Vector3d> &frame,
                                                     const std::vector<double> &timestamps,
                                                     const std::optional<Sophus::SE3d> &pose_hint,
-                                                    bool imu_orientation_valid) {
+                                                    bool imu_orientation_valid,
+                                                    bool inertial_translation_valid) {
     // Preprocess the input cloud
     const auto &preprocessed_frame = preprocessor_.Preprocess(frame, timestamps, last_delta_);
 
@@ -54,10 +55,12 @@ KissICP::Vector3dVectorTuple KissICP::RegisterFrame(const std::vector<Eigen::Vec
 
     // Run ICP
     const bool imu_prior_valid = imu_orientation_valid && pose_hint.has_value();
+    auto surface = config_.surface;
+    surface.inertial_translation_valid = inertial_translation_valid && imu_prior_valid;
     const auto new_pose = registration_.AlignPointsToMap(
         source, local_map_, initial_guess, 3.0 * sigma, sigma,
         config_.fix_rotation_from_hint && imu_prior_valid,
-        imu_prior_valid ? config_.rotation_prior_information : 0.0, config_.surface);
+        imu_prior_valid ? config_.rotation_prior_information : 0.0, surface);
 
     last_quality_ = RegistrationQuality{};
     if (config_.surface.enabled && !local_map_.Empty() &&

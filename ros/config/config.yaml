@@ -5,6 +5,13 @@
 kiss_icp_node:
   ros__parameters:
     use_imu_prediction: false # Generic default; G1 mapping/localization enable scan-time IMU rotation.
+    inertial_prediction:
+      enabled: false # G1 profile enables acceleration/bias prediction for weak geometry.
+      acceleration_noise: 0.2
+      bias_walk: 0.005
+      position_noise: 0.02
+      max_sample_gap: 0.05
+      gravity_magnitude: 9.806
     use_leg_prediction: false # Optional leg translation seed; independent of fusion factors.
     ####    /!\ If you set these ROS-related parameters in the file, they will overwrite the corresponding launch arguments   ####
 

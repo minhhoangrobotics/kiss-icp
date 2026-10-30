@@ -39,6 +39,7 @@ struct SurfaceOptions {
     double covariance_regularization = 0.01;
     bool directional_hybrid = false;
     double translation_eigenvalue_ratio = 0.02;
+    bool inertial_translation_valid = false;
 };
 
 struct SurfaceDiagnostics {
@@ -46,6 +47,7 @@ struct SurfaceDiagnostics {
     int rank = 0;
     bool fallback = false;
     double residual_rmse = 0.0;
+    Eigen::Matrix3d observable_translation = Eigen::Matrix3d::Identity();
 };
 
 struct Registration {

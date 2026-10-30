@@ -98,6 +98,20 @@ OdometryServer::OdometryServer(const rclcpp::NodeOptions &options)
             }, sensor_options);
     }
     use_imu_prediction_ = declare_parameter<bool>("use_imu_prediction", false);
+    use_inertial_translation_ = declare_parameter<bool>("inertial_prediction.enabled", false);
+    inertial_prediction_.acceleration_noise = declare_parameter<double>("inertial_prediction.acceleration_noise", 0.2);
+    inertial_prediction_.bias_walk = declare_parameter<double>("inertial_prediction.bias_walk", 0.005);
+    inertial_prediction_.position_noise = declare_parameter<double>("inertial_prediction.position_noise", 0.02);
+    inertial_prediction_.max_sample_gap = declare_parameter<double>("inertial_prediction.max_sample_gap", 0.05);
+    gravity_magnitude_ = declare_parameter<double>("inertial_prediction.gravity_magnitude", 9.806);
+    for (double value : {inertial_prediction_.acceleration_noise, inertial_prediction_.bias_walk,
+                         inertial_prediction_.position_noise, inertial_prediction_.max_sample_gap,
+                         gravity_magnitude_})
+        if (!std::isfinite(value) || value<=0.0) throw std::invalid_argument("Invalid inertial_prediction parameter");
+    if (use_inertial_translation_ && !use_imu_prediction_)
+        throw std::invalid_argument("inertial_prediction requires use_imu_prediction");
+    RCLCPP_INFO(get_logger(), "Inertial translation prediction: %s; LiDAR updates observable directions only",
+                use_inertial_translation_ ? "enabled" : "disabled");
     if (use_imu_prediction_) {
         imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
             "imu_topic", rclcpp::SensorDataQoS().keep_last(50),
@@ -331,12 +345,42 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
             }
         }
     }
+    bool inertial_translation_valid = false;
+    if (use_inertial_translation_ && inertial_prediction_.initialized() &&
+        imu_orientation && odom_from_imu_orientation_) {
+        std::vector<kiss_icp::InertialSample> samples;
+        {
+            std::lock_guard<std::mutex> lock(sensor_queue_mutex_);
+            samples.reserve(recent_imu_.size());
+            for (const auto& item : recent_imu_) {
+                if (item->header.frame_id != cached_imu_frame_) continue;
+                const auto& q=item->orientation;
+                const auto& a=item->linear_acceleration;
+                Eigen::Quaterniond orientation(q.w,q.x,q.y,q.z);
+                Eigen::Vector3d acceleration(a.x,a.y,a.z);
+                const double time=rclcpp::Time(item->header.stamp).seconds();
+                if (!orientation.coeffs().allFinite() || orientation.norm()<0.5 ||
+                    !acceleration.allFinite() || (!samples.empty() && time<=samples.back().time)) continue;
+                samples.push_back({time, (*odom_from_imu_orientation_*orientation.normalized()).normalized(),
+                                   acceleration});
+            }
+        }
+        inertial_translation_valid = inertial_prediction_.Predict(rclcpp::Time(msg->header.stamp).seconds(),samples);
+        if (inertial_translation_valid) {
+            const Sophus::SO3d rotation((*odom_from_imu_orientation_ * *imu_orientation).normalized());
+            const Sophus::SE3d base(rotation,inertial_prediction_.position()-rotation*base_to_imu_translation_);
+            pose_hint = base * base_to_lidar;
+        } else {
+            RCLCPP_WARN_THROTTLE(get_logger(),*get_clock(),5000,
+                                "Inertial translation unavailable: IMU does not cover the scan interval");
+        }
+    }
     const auto points = PointCloud2ToEigen(msg);
     const auto timestamps = GetTimestamps(msg);
 
     // Register frame, main entry point to KISS-ICP pipeline
     auto registration = kiss_icp_->RegisterFrame(points, timestamps, pose_hint,
-                                                 imu_orientation.has_value());
+                                                 imu_orientation.has_value(), inertial_translation_valid);
     const auto &first_quality = kiss_icp_->registration_quality();
     const double rejected_age = previous_scan_stamp_.nanoseconds() == 0 ? 0.0 :
         (rclcpp::Time(msg->header.stamp) - previous_scan_stamp_).seconds();
@@ -362,14 +406,18 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
         kiss_icp_->ResetToPose(predicted_lidar);
         registration = kiss_icp_->RegisterFrame(points, timestamps, predicted_lidar,
                                                 imu_orientation.has_value());
+        // The reseeded map has a new translational reference. Reinitialize
+        // the filter at the accepted pose instead of correcting a stale prior.
+        inertial_translation_valid = false;
     }
     const auto &[frame, keypoints] = registration;
     const auto &quality = kiss_icp_->registration_quality();
     const auto& surface = kiss_icp_->surface_diagnostics();
     if (surface.correspondences > 0 || surface.fallback) {
         RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
-            "KISS surface: matches=%zu rank=%d/6 metric_RMSE=%.4f m fallback=%s",
-            surface.correspondences, surface.rank, surface.residual_rmse,
+            "KISS surface: matches=%zu rank=%d/6 observable_translation=%.0f/3 metric_RMSE=%.4f m inertial=%s fallback=%s",
+            surface.correspondences, surface.rank, surface.observable_translation.trace(), surface.residual_rmse,
+            inertial_translation_valid ? "yes" : "no",
             surface.fallback ? "point_to_point" : "no");
     }
     std_msgs::msg::Bool accepted_msg;
@@ -397,6 +445,24 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
               (kiss_icp_->pose() * base_to_lidar.inverse()).so3().unit_quaternion();
           odom_from_imu_orientation_ =
               (odom_base * imu_orientation->conjugate()).normalized();
+      }
+      if (use_inertial_translation_ && odom_from_imu_orientation_ && imu_orientation) {
+          const Eigen::Vector3d imu_position=current_base_pose.translation()+
+                                             current_base_pose.so3()*base_to_imu_translation_;
+          if (inertial_translation_valid)
+              inertial_prediction_.Correct(imu_position, surface.observable_translation);
+          else
+              inertial_prediction_.Initialize(rclcpp::Time(msg->header.stamp).seconds(),imu_position,
+                  *odom_from_imu_orientation_ * Eigen::Vector3d(0,0,-gravity_magnitude_));
+          const int observable=static_cast<int>(std::lround(surface.observable_translation.trace()));
+          if(observable!=last_observable_rank_) {
+              RCLCPP_INFO(get_logger(),"LiDAR translation observability: %d/3; unobserved motion uses inertial prediction",observable);
+              last_observable_rank_=observable;
+          }
+          RCLCPP_INFO_THROTTLE(get_logger(),*get_clock(),5000,
+              "Inertial motion: speed %.3f m/s, bias norm %.4f m/s^2, position sigma norm %.3f m",
+              inertial_prediction_.velocity().norm(),inertial_prediction_.bias().norm(),
+              std::sqrt(std::max(0.0,inertial_prediction_.covariance().topLeftCorner<3,3>().trace())));
       }
       if (use_leg_height_constraint_ && leg_pose && !leg_height_anchor_) {
           leg_height_anchor_ = leg_pose->translation().z();
@@ -516,6 +582,8 @@ std::optional<Eigen::Quaterniond> OdometryServer::ImuBaseOrientationAt(const rcl
             const Eigen::Quaterniond base_imu(q.w, q.x, q.y, q.z);
             if (!base_imu.coeffs().allFinite() || base_imu.norm() < 0.5) return std::nullopt;
             base_to_imu_rotation_ = base_imu.normalized();
+            const auto& p=tf.transform.translation;
+            base_to_imu_translation_=Eigen::Vector3d(p.x,p.y,p.z);
             cached_imu_frame_ = sample->header.frame_id;
         } catch (const tf2::TransformException &) {
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
@@ -600,6 +668,8 @@ void OdometryServer::ResetService(
     previous_base_pose_.reset();
     previous_base_delta_ = Sophus::SE3d();
     previous_scan_interval_ = 0.0;
+    inertial_prediction_.Reset();
+    last_observable_rank_ = -1;
     previous_imu_base_orientation_.reset();
     odom_from_imu_orientation_.reset();
     odom_base_height_at_leg_anchor_.reset();

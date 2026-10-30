@@ -153,7 +153,7 @@ Sophus::SE3d AlignSurfaces(const std::vector<Eigen::Vector3d>& frame,
                     const Eigen::Vector3d lever = estimate.so3() * point;
                     const Eigen::Vector3d source = lever + estimate.translation();
                     Eigen::Vector3d target, normal = Eigen::Vector3d::Zero();
-                    if (options.directional_hybrid && exact_map) {
+                    if (options.directional_hybrid && exact_map && !options.inertial_translation_valid) {
                         const auto [point_match, point_distance] = exact_map->GetClosestNeighbor(source);
                         if (point_distance < max_distance) {
                             const auto point_residual = (source-point_match).eval();
@@ -219,12 +219,12 @@ Sophus::SE3d AlignSurfaces(const std::vector<Eigen::Vector3d>& frame,
         diagnostics.correspondences = count;
         diagnostics.residual_rmse = count ? std::sqrt(system.error2 / static_cast<double>(count)) : 0.0;
         if (count < 6) break;
-        if (options.directional_hybrid && system.point_information > 0.0) {
+        if (options.directional_hybrid && (system.point_information > 0.0 || options.inertial_translation_valid)) {
             // Plane normals constrain some translation directions much more
-            // strongly than others. Use the point associations from THIS scan
-            // in the weak subspace, rather than amplify noisy plane normals or
-            // freeze the robot there. Strong directions and rotation retain
-            // the surface metric. No cap on the estimated motion is applied.
+            // strongly than others. Use an independent inertial prior when
+            // available, otherwise current-scan point associations, in weak
+            // directions. Strong directions and rotation retain the surface
+            // metric.
             Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> geometry(H.topLeftCorner<3,3>());
             if (geometry.info() == Eigen::Success) {
                 Eigen::Matrix3d strong = Eigen::Matrix3d::Zero();
@@ -239,12 +239,22 @@ Sophus::SE3d AlignSurfaces(const std::vector<Eigen::Vector3d>& frame,
                                             geometry.eigenvectors().col(k).transpose();
                 }
                 const Eigen::Matrix3d weak = Eigen::Matrix3d::Identity()-strong;
+                diagnostics.observable_translation = strong;
                 Eigen::Matrix6d projection = Eigen::Matrix6d::Identity();
                 projection.topLeftCorner<3,3>() = strong;
                 H = (projection * H * projection).eval();
                 b = (projection * b).eval();
-                H.topLeftCorner<3,3>() += system.point_information * weak;
-                b.head<3>() += weak * system.point_gradient;
+                if (options.inertial_translation_valid) {
+                    // No geometric measurement exists along this subspace.
+                    // Keep the independently IMU-propagated translation prior;
+                    // discrete floor samples must not invent velocity there.
+                    const double information=static_cast<double>(count);
+                    H.topLeftCorner<3,3>() += information * weak;
+                    b.head<3>() += information * weak * (estimate.translation()-initial_guess.translation());
+                } else {
+                    H.topLeftCorner<3,3>() += system.point_information * weak;
+                    b.head<3>() += weak * system.point_gradient;
+                }
             }
         }
         // The absolute scan-time IMU attitude is a measurement, not a clamp.

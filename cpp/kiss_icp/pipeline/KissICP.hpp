@@ -94,7 +94,8 @@ public:
     Vector3dVectorTuple RegisterFrame(const std::vector<Eigen::Vector3d> &frame,
                                       const std::vector<double> &timestamps,
                                       const std::optional<Sophus::SE3d> &pose_hint = std::nullopt,
-                                      bool imu_orientation_valid = false);
+                                      bool imu_orientation_valid = false,
+                                      bool inertial_translation_valid = false);
     Vector3dVectorTuple Voxelize(const std::vector<Eigen::Vector3d> &frame) const;
 
     std::vector<Eigen::Vector3d> LocalMap() const { return local_map_.Pointcloud(); };

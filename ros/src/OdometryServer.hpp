@@ -24,6 +24,7 @@
 
 // KISS-ICP
 #include "kiss_icp/pipeline/KissICP.hpp"
+#include "kiss_icp/core/InertialPrediction.hpp"
 
 // ROS 2
 #include <nav_msgs/msg/odometry.hpp>
@@ -106,6 +107,11 @@ private:
     bool use_leg_height_constraint_ = false;
     double reseed_after_rejection_seconds_ = 1.5;
     bool use_imu_prediction_ = false;
+    bool use_inertial_translation_ = false;
+    double gravity_magnitude_ = 9.806;
+    Eigen::Vector3d base_to_imu_translation_ = Eigen::Vector3d::Zero();
+    kiss_icp::InertialPrediction inertial_prediction_;
+    int last_observable_rank_ = -1;
 
     /// Data publishers.
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_publisher_;
