@@ -244,6 +244,9 @@ void OdometryServer::initializeParameters(kiss_icp::pipeline::KISSConfig &config
     if (!std::isfinite(config.surface.translation_eigenvalue_ratio) ||
         config.surface.translation_eigenvalue_ratio <= 0.0 || config.surface.translation_eigenvalue_ratio >= 1.0)
         throw std::invalid_argument("registration.translation_eigenvalue_ratio must be in (0,1)");
+    config.surface.correspondence_gate_sigma=declare_parameter<double>("registration.correspondence_gate_sigma",0.0);
+    if(!std::isfinite(config.surface.correspondence_gate_sigma) || config.surface.correspondence_gate_sigma<0.0)
+        throw std::invalid_argument("registration.correspondence_gate_sigma must be finite and nonnegative");
     config.surface.neighbors = declare_parameter<int>("registration.normal_neighbors", 10);
     config.surface.radius = declare_parameter<double>("registration.normal_radius", 1.2);
     config.surface.planarity_ratio = declare_parameter<double>("registration.planarity_ratio", 0.15);
@@ -498,6 +501,11 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
     const auto &[frame, keypoints] = registration;
     const auto &quality = kiss_icp_->registration_quality();
     const auto& surface = kiss_icp_->surface_diagnostics();
+    if(surface.inconsistent_correspondences>0) {
+        RCLCPP_INFO_THROTTLE(get_logger(),*get_clock(),5000,
+            "Plane association consistency: %zu retained, %zu inconsistent; max normalized squared residual %.2f",
+            surface.correspondences,surface.inconsistent_correspondences,surface.maximum_squared_innovation);
+    }
     if (surface.correspondences > 0 || surface.fallback) {
         RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
             "KISS surface: matches=%zu rank=%d/6 observable_translation=%.0f/3 metric_RMSE=%.4f m inertial=%s fallback=%s",

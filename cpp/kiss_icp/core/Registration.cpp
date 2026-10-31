@@ -41,6 +41,8 @@
 #include "VoxelHashMap.hpp"
 #include "VoxelUtils.hpp"
 #include "Surface.hpp"
+#include "CorrespondenceGate.hpp"
+#include <Eigen/Cholesky>
 
 namespace Eigen {
 using Matrix6d = Eigen::Matrix<double, 6, 6>;
@@ -140,11 +142,25 @@ Sophus::SE3d AlignSurfaces(const std::vector<Eigen::Vector3d>& frame,
         Eigen::Vector6d b = Eigen::Vector6d::Zero();
         Eigen::Matrix6d measured_H=Eigen::Matrix6d::Zero();
         Eigen::Vector6d measured_b=Eigen::Vector6d::Zero();
-        size_t count = 0;
+        size_t count = 0, inconsistent = 0;
+        double maximum_squared_innovation = 0.0;
         double error2 = 0.0;
         double point_information = 0.0;
         Eigen::Vector3d point_gradient = Eigen::Vector3d::Zero();
     };
+    kiss_icp::PlaneCorrespondenceGate gate;
+    if(options.correspondence_gate_sigma>0.0 && options.inertial_information.trace()>0.0 &&
+       exact_map && rotation_information>0.0) {
+        const double variance=exact_map->voxel_size_*exact_map->voxel_size_;
+        const Eigen::LDLT<Eigen::Matrix3d> prediction(options.inertial_information);
+        if(prediction.info()==Eigen::Success && prediction.isPositive()) {
+            gate.position_covariance=variance*prediction.solve(Eigen::Matrix3d::Identity());
+            gate.surface_variance=variance/6.0;
+            gate.angular_variance=variance/rotation_information;
+            gate.squared_sigma=options.correspondence_gate_sigma*options.correspondence_gate_sigma;
+            gate.enabled=gate.position_covariance.allFinite();
+        }
+    }
     Sophus::SE3d estimate = initial_guess;
     for (int iteration = 0; iteration < iterations; ++iteration) {
         auto system = tbb::parallel_reduce(
@@ -175,6 +191,14 @@ Sophus::SE3d AlignSurfaces(const std::vector<Eigen::Vector3d>& frame,
                         const size_t match = near.front().second;
                         normal = normals[match];
                         target = targets[match];
+                    }
+                    if(gate.enabled && normal.squaredNorm()>.5) {
+                        // Test against the scan-time prediction, not a pose
+                        // already pulled toward this correspondence by ICP.
+                        const double innovation=gate.SquaredInnovation(initial_guess.so3()*point,
+                            initial_guess.translation(),target,normal);
+                        local.maximum_squared_innovation=std::max(local.maximum_squared_innovation,innovation);
+                        if(!gate.Accept(innovation)){++local.inconsistent;continue;}
                     }
                     const Eigen::Vector3d residual = source - target;
                     Eigen::Matrix3d information;
@@ -218,6 +242,8 @@ Sophus::SE3d AlignSurfaces(const std::vector<Eigen::Vector3d>& frame,
                 a.measured_H+=other.measured_H;
                 a.measured_b+=other.measured_b;
                 a.count += other.count;
+                a.inconsistent += other.inconsistent;
+                a.maximum_squared_innovation=std::max(a.maximum_squared_innovation,other.maximum_squared_innovation);
                 a.error2 += other.error2;
                 a.point_information += other.point_information;
                 a.point_gradient += other.point_gradient;
@@ -227,6 +253,8 @@ Sophus::SE3d AlignSurfaces(const std::vector<Eigen::Vector3d>& frame,
         auto& b = system.b;
         const auto count = system.count;
         diagnostics.correspondences = count;
+        diagnostics.inconsistent_correspondences=system.inconsistent;
+        diagnostics.maximum_squared_innovation=system.maximum_squared_innovation;
         diagnostics.residual_rmse = count ? std::sqrt(system.error2 / static_cast<double>(count)) : 0.0;
         if (count < 6) break;
         // Keep the independent LiDAR likelihood before adding any prediction

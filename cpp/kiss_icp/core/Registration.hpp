@@ -41,11 +41,14 @@ struct SurfaceOptions {
     double translation_eigenvalue_ratio = 0.02;
     bool inertial_translation_valid = false;
     bool covariance_inertial_prior = true;
+    double correspondence_gate_sigma = 0.0; // 0 preserves ungated association; >0 is a normalized plane innovation.
     Eigen::Matrix3d inertial_information = Eigen::Matrix3d::Zero();
 };
 
 struct SurfaceDiagnostics {
     size_t correspondences = 0;
+    size_t inconsistent_correspondences = 0;
+    double maximum_squared_innovation = 0.0;
     int rank = 0;
     bool fallback = false;
     double residual_rmse = 0.0;
