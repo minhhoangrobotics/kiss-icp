@@ -1,3 +1,4 @@
+#include "kiss_icp/core/LidarLikelihood.hpp"
 // MIT License
 //
 // Copyright (c) 2022 Ignacio Vizzo, Tiziano Guadagnino, Benedikt Mersch, Cyrill
@@ -87,7 +88,13 @@ OdometryServer::OdometryServer(const rclcpp::NodeOptions &options)
     use_leg_height_constraint_ = declare_parameter<bool>("use_leg_height_constraint", false);
     RCLCPP_INFO(get_logger(), "Leg motion prediction for KISS ICP: %s",
                 use_leg_prediction_ ? "enabled" : "disabled");
-    if (use_leg_prediction_ || use_leg_height_constraint_) {
+    use_leg_displacement_=declare_parameter<bool>("contact_displacement.enabled",false);
+    contact_aid_.displacement_sigma=declare_parameter<double>("contact_displacement.sigma",.01);
+    contact_aid_.max_joint_gap=declare_parameter<double>("contact_displacement.max_joint_gap",.04);
+    contact_aid_.max_interval=declare_parameter<double>("contact_displacement.max_interval",.25);
+    for(double value:{contact_aid_.displacement_sigma,contact_aid_.max_joint_gap,contact_aid_.max_interval})
+        if(!std::isfinite(value)||value<=0)throw std::invalid_argument("Invalid contact_displacement parameter");
+    if (use_leg_prediction_ || use_leg_height_constraint_ || use_leg_displacement_) {
         leg_odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
             "leg_odometry_topic", 20, [this](const nav_msgs::msg::Odometry::ConstSharedPtr msg) {
                 std::lock_guard<std::mutex> lock(sensor_queue_mutex_);
@@ -118,6 +125,8 @@ OdometryServer::OdometryServer(const rclcpp::NodeOptions &options)
                          inertial_prediction_.position_noise, inertial_prediction_.max_sample_gap,
                          gravity_magnitude_})
         if (!std::isfinite(value) || value<=0.0) throw std::invalid_argument("Invalid inertial_prediction parameter");
+    if(use_leg_displacement_ && !use_inertial_translation_)
+        throw std::invalid_argument("contact_displacement requires inertial_prediction");
     if (use_inertial_translation_ && !use_imu_prediction_)
         throw std::invalid_argument("inertial_prediction requires use_imu_prediction");
     RCLCPP_INFO(get_logger(), "Inertial translation prediction: %s; LiDAR updates observable directions only",
@@ -145,6 +154,8 @@ OdometryServer::OdometryServer(const rclcpp::NodeOptions &options)
     // Initialize publishers
     rclcpp::QoS qos((rclcpp::SystemDefaultsQoS().keep_last(1).durability_volatile()));
     odom_publisher_ = create_publisher<nav_msgs::msg::Odometry>("kiss/odometry", qos);
+    lidar_likelihood_publisher_=create_publisher<nav_msgs::msg::Odometry>("kiss/lidar_pose",qos);
+    RCLCPP_INFO(get_logger(),"Publishing independent LiDAR pose likelihood on kiss/lidar_pose; posterior on kiss/odometry");
     registration_status_publisher_ = create_publisher<std_msgs::msg::Bool>(
         "kiss/registration_accepted", qos);
     quality_publisher_ = create_publisher<std_msgs::msg::Float32MultiArray>(
@@ -382,6 +393,32 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
             }
         }
     }
+    if(use_leg_displacement_ && inertial_prediction_.initialized()) {
+        std::vector<kiss_icp::ContactSample> contacts;
+        {
+            std::lock_guard<std::mutex> lock(sensor_queue_mutex_);
+            for(const auto& item:recent_leg_poses_) {
+                if(contact_frame_.empty()) {
+                    contact_frame_=item->header.frame_id;contact_child_frame_=item->child_frame_id;
+                }
+                const auto& p=item->pose.pose.position;const auto& q=item->pose.pose.orientation;
+                Eigen::Vector3d position(p.x,p.y,p.z);Eigen::Quaterniond orientation(q.w,q.x,q.y,q.z);
+                const double time=rclcpp::Time(item->header.stamp).seconds();
+                if(!std::isfinite(time)||(!contacts.empty() && time<=contacts.back().time))continue;
+                const bool valid=item->header.frame_id==contact_frame_ &&
+                    item->child_frame_id==contact_child_frame_ && item->child_frame_id==base_frame_ &&
+                    position.allFinite() && orientation.coeffs().allFinite() && orientation.norm()>.5 &&
+                    std::isfinite(item->pose.covariance[0]) &&
+                    item->pose.covariance[0]>=0;
+                // Retain invalid support explicitly; never bridge a held pose.
+                contacts.push_back({time,position,valid?orientation.normalized():Eigen::Quaterniond::Identity(),valid});
+            }
+        }
+        contact_aid_.imu_origin_base=base_to_imu_translation_;
+        const size_t updates=contact_aid_.Update(inertial_prediction_,contacts);contact_updates_+=updates;
+        RCLCPP_INFO_THROTTLE(get_logger(),*get_clock(),10000,
+            "Contact displacement: %zu total delayed intervals fused (%zu new); no absolute leg position",contact_updates_,updates);
+    }
     bool inertial_translation_valid = false;
     if (use_inertial_translation_ && inertial_prediction_.initialized() &&
         imu_orientation && odom_from_imu_orientation_) {
@@ -502,6 +539,8 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
           else
               inertial_prediction_.Initialize(rclcpp::Time(msg->header.stamp).seconds(),imu_position,
                   *odom_from_imu_orientation_ * Eigen::Vector3d(0,0,-gravity_magnitude_));
+          if(use_leg_displacement_)inertial_prediction_.Clone(rclcpp::Time(msg->header.stamp).seconds(),
+              current_base_pose.so3().unit_quaternion());
           const int observable=static_cast<int>(std::lround(surface.observable_translation.trace()));
           if(observable!=last_observable_rank_) {
               RCLCPP_INFO(get_logger(),"LiDAR translation observability: %d/3; unobserved motion uses inertial prediction",observable);
@@ -689,7 +728,21 @@ void OdometryServer::PublishOdometry(const Sophus::SE3d &kiss_pose,
     odom_msg.pose.covariance[21] = orientation_covariance_;
     odom_msg.pose.covariance[28] = orientation_covariance_;
     odom_msg.pose.covariance[35] = orientation_covariance_;
-    odom_publisher_->publish(std::move(odom_msg));
+    if(use_inertial_translation_ && inertial_prediction_.initialized()) {
+        const Eigen::Matrix3d R=output_from_internal_->rotationMatrix();
+        const Eigen::Matrix3d position_covariance=R*inertial_prediction_.covariance().topLeftCorner<3,3>()*R.transpose();
+        for(int i=0;i<3;++i)for(int j=0;j<3;++j)
+            odom_msg.pose.covariance[static_cast<size_t>(6*i+j)]=position_covariance(i,j);
+    }
+    odom_publisher_->publish(odom_msg);
+    const auto likelihood=kiss_icp::IndependentLidarLikelihood(kiss_icp_->surface_diagnostics(),
+        egocentric_estimation?Sophus::SE3d():base_to_lidar,*output_from_internal_);
+    if(likelihood) {
+        odom_msg.pose.pose=tf2::sophusToPose(likelihood->pose);
+        for(int i=0;i<6;++i)for(int j=0;j<6;++j)
+            odom_msg.pose.covariance[static_cast<size_t>(6*i+j)]=likelihood->covariance(i,j);
+        lidar_likelihood_publisher_->publish(odom_msg);
+    }
 }
 
 void OdometryServer::PublishClouds(const std::vector<Eigen::Vector3d> &frame,
@@ -723,6 +776,7 @@ void OdometryServer::ResetService(
     previous_base_delta_ = Sophus::SE3d();
     previous_scan_interval_ = 0.0;
     inertial_prediction_.Reset();
+    contact_aid_.Reset();contact_updates_=0;contact_frame_.clear();contact_child_frame_.clear();
     last_observable_rank_ = -1;
     previous_imu_base_orientation_.reset();
     odom_from_imu_orientation_.reset();

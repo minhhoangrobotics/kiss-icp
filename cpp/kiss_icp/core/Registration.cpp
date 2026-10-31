@@ -138,6 +138,8 @@ Sophus::SE3d AlignSurfaces(const std::vector<Eigen::Vector3d>& frame,
     struct NormalSystem {
         Eigen::Matrix6d H = Eigen::Matrix6d::Zero();
         Eigen::Vector6d b = Eigen::Vector6d::Zero();
+        Eigen::Matrix6d measured_H=Eigen::Matrix6d::Zero();
+        Eigen::Vector6d measured_b=Eigen::Vector6d::Zero();
         size_t count = 0;
         double error2 = 0.0;
         double point_information = 0.0;
@@ -200,6 +202,12 @@ Sophus::SE3d AlignSurfaces(const std::vector<Eigen::Vector3d>& frame,
                     const double weight = square(square(kernel_scale) / (square(kernel_scale) + residual2));
                     local.H.noalias() += weight * J.transpose() * information * J;
                     local.b.noalias() += weight * J.transpose() * information * residual;
+                    // The normal is physically constrained. GICP's tangential
+                    // regularizer is useful for association, but must never
+                    // be counted as an independent motion observation.
+                    const Eigen::Matrix3d measured=normal*normal.transpose();
+                    local.measured_H.noalias() += weight*J.transpose()*measured*J;
+                    local.measured_b.noalias() += weight*J.transpose()*measured*residual;
                     local.error2 += residual2;
                     ++local.count;
                 }
@@ -207,6 +215,8 @@ Sophus::SE3d AlignSurfaces(const std::vector<Eigen::Vector3d>& frame,
             }, [](NormalSystem a, const NormalSystem& other) {
                 a.H += other.H;
                 a.b += other.b;
+                a.measured_H+=other.measured_H;
+                a.measured_b+=other.measured_b;
                 a.count += other.count;
                 a.error2 += other.error2;
                 a.point_information += other.point_information;
@@ -223,9 +233,9 @@ Sophus::SE3d AlignSurfaces(const std::vector<Eigen::Vector3d>& frame,
         // prior. The state filter must not fuse its own prior a second time.
         diagnostics.has_translation_measurement = options.inertial_translation_valid &&
             options.covariance_inertial_prior && options.inertial_information.trace()>0.0;
-        diagnostics.translation_information=H.topLeftCorner<3,3>();
-        diagnostics.translation_rotation_information=H.topRightCorner<3,3>();
-        diagnostics.translation_gradient=b.head<3>();
+        diagnostics.translation_information=system.measured_H.topLeftCorner<3,3>();
+        diagnostics.translation_rotation_information=system.measured_H.topRightCorner<3,3>();
+        diagnostics.translation_gradient=system.measured_b.head<3>();
         diagnostics.linearization_position=estimate.translation();
         diagnostics.linearization_rotation=estimate.so3();
         if (options.directional_hybrid && (system.point_information > 0.0 || options.inertial_translation_valid)) {
@@ -239,8 +249,8 @@ Sophus::SE3d AlignSurfaces(const std::vector<Eigen::Vector3d>& frame,
                 Eigen::Matrix3d strong = Eigen::Matrix3d::Zero();
                 // Compare against the second supported direction. A dense
                 // floor must not drown out the information from sparse walls.
-                // Require at least one effective unit-normal observation.
-                const double threshold = std::max(1.0, options.translation_eigenvalue_ratio *
+                // Absolute point-count cutoffs discard valid sparse walls.
+                const double threshold = std::max(1e-6, options.translation_eigenvalue_ratio *
                                                        geometry.eigenvalues()[1]);
                 for (int k=0; k<3; ++k) {
                     if (geometry.eigenvalues()[k] > std::max(1e-9,threshold))
@@ -252,9 +262,9 @@ Sophus::SE3d AlignSurfaces(const std::vector<Eigen::Vector3d>& frame,
                 Eigen::Matrix6d projection = Eigen::Matrix6d::Identity();
                 projection.topLeftCorner<3,3>() = strong;
                 if (diagnostics.has_translation_measurement) {
-                    // Weak geometry still contains measurements. Retain its
-                    // Hessian/cross terms and weight the independent prior by
-                    // its propagated covariance, rather than by point count.
+                    // Retain real weak-plane information with its measured
+                    // covariance; sparse geometry must not become a hard
+                    // motion freeze when no independent contact is available.
                     const Eigen::Matrix3d prior=weak*options.inertial_information*weak;
                     H.topLeftCorner<3,3>()+=prior;
                     b.head<3>()+=prior*(estimate.translation()-initial_guess.translation());
@@ -275,6 +285,8 @@ Sophus::SE3d AlignSurfaces(const std::vector<Eigen::Vector3d>& frame,
                 }
             }
         }
+        diagnostics.pose_information=system.measured_H;
+        diagnostics.pose_gradient=system.measured_b;
         // The absolute scan-time IMU attitude is a measurement, not a clamp.
         H.bottomRightCorner<3, 3>().diagonal().array() += rotation_information;
         b.tail<3>() += rotation_information * (estimate.so3() * initial_guess.so3().inverse()).log();

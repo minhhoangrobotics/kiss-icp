@@ -25,6 +25,7 @@
 // KISS-ICP
 #include "kiss_icp/pipeline/KissICP.hpp"
 #include "kiss_icp/core/InertialPrediction.hpp"
+#include "kiss_icp/core/ContactDisplacement.hpp"
 
 // ROS 2
 #include <nav_msgs/msg/odometry.hpp>
@@ -107,6 +108,10 @@ private:
     std::optional<Eigen::Quaterniond> base_to_imu_rotation_;
     std::string cached_imu_frame_;
     rclcpp::Time previous_scan_stamp_{0, 0, RCL_ROS_TIME};
+    bool use_leg_displacement_ = false;
+    kiss_icp::ContactDisplacementAid contact_aid_;
+    size_t contact_updates_=0;
+    std::string contact_frame_, contact_child_frame_;
     bool use_leg_prediction_ = false;
     bool use_leg_height_constraint_ = false;
     double reseed_after_rejection_seconds_ = 1.5;
@@ -118,7 +123,7 @@ private:
     int last_observable_rank_ = -1;
 
     /// Data publishers.
-    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_publisher_;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_publisher_, lidar_likelihood_publisher_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr registration_status_publisher_;
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr quality_publisher_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr frame_publisher_;

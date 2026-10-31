@@ -57,6 +57,8 @@ struct SurfaceDiagnostics {
     Eigen::Vector3d translation_gradient = Eigen::Vector3d::Zero();
     Eigen::Vector3d linearization_position = Eigen::Vector3d::Zero();
     Sophus::SO3d linearization_rotation;
+    Eigen::Matrix<double,6,6> pose_information=Eigen::Matrix<double,6,6>::Zero();
+    Eigen::Matrix<double,6,1> pose_gradient=Eigen::Matrix<double,6,1>::Zero();
 };
 
 struct Registration {
