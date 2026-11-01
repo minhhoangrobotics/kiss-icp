@@ -31,17 +31,19 @@
 #include <Eigen/Core>
 #include <sophus/se3.hpp>
 #include <vector>
+#include <optional>
 
 #include "VoxelUtils.hpp"
 
 namespace kiss_icp {
 struct VoxelHashMap {
-    explicit VoxelHashMap(double voxel_size, double max_distance, unsigned int max_points_per_voxel)
+    explicit VoxelHashMap(double voxel_size, double max_distance, unsigned int max_points_per_voxel,
+                         bool surface_index = false)
         : voxel_size_(voxel_size),
           max_distance_(max_distance),
-          max_points_per_voxel_(max_points_per_voxel) {}
+          max_points_per_voxel_(max_points_per_voxel), surface_index_enabled_(surface_index) {}
 
-    inline void Clear() { map_.clear(); normals_.clear(); }
+    inline void Clear() { map_.clear(); normals_.clear(); surface_buckets_.clear(); surface_points_ = 0; }
     inline bool Empty() const { return map_.empty(); }
     void Update(const std::vector<Eigen::Vector3d> &points, const Eigen::Vector3d &origin);
     void Update(const std::vector<Eigen::Vector3d> &points, const Sophus::SE3d &pose);
@@ -57,11 +59,21 @@ struct VoxelHashMap {
     std::tuple<Eigen::Vector3d, double> GetClosestNeighbor(const Eigen::Vector3d &query) const;
     std::tuple<Eigen::Vector3d, double> GetClosestNeighbor(
         const Eigen::Vector3d& query, double max_distance) const;
+    struct SurfaceNeighbor { Eigen::Vector3d point, normal; double distance; };
+    std::optional<SurfaceNeighbor> GetClosestSurfaceNeighbor(
+        const Eigen::Vector3d& query, double max_distance) const;
+    size_t SurfaceSize() const { return surface_points_; }
 
     double voxel_size_;
     double max_distance_;
     unsigned int max_points_per_voxel_;
     tsl::robin_map<Voxel, std::vector<Eigen::Vector3d>> map_;
     tsl::robin_map<Voxel, std::vector<Eigen::Vector3d>> normals_;
+    size_t surface_points_ = 0;
+    bool surface_index_enabled_ = false;
+    tsl::robin_map<Voxel, std::vector<Voxel>> surface_buckets_;
+    static Voxel SurfaceBucket(const Voxel& fine) {
+        return (fine.cast<double>()/4.0).array().floor().cast<int>();
+    }
 };
 }  // namespace kiss_icp

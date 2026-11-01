@@ -133,7 +133,9 @@ Sophus::SE3d AlignSurfaces(const std::vector<Eigen::Vector3d>& frame,
                            kiss_icp::SurfaceDiagnostics& diagnostics,
                            const kiss_icp::VoxelHashMap* exact_map = nullptr) {
     std::unique_ptr<kiss_icp::PointIndex> index;
-    if (options.covariance_regularization < 1.0) index = std::make_unique<kiss_icp::PointIndex>(targets);
+    const bool voxel_surfaces = options.voxel_surface_index && exact_map;
+    if (options.covariance_regularization < 1.0 && !voxel_surfaces)
+        index = std::make_unique<kiss_icp::PointIndex>(targets);
     const auto source_normals = options.covariance_regularization > 0.0 && options.covariance_regularization < 1.0 ?
         kiss_icp::EstimateNormals(frame, options.neighbors, options.radius, options.planarity_ratio) :
         std::vector<Eigen::Vector3d>{};
@@ -187,6 +189,10 @@ Sophus::SE3d AlignSurfaces(const std::vector<Eigen::Vector3d>& frame,
                         const auto [matched, distance] = exact_map->GetClosestNeighbor(source, max_distance);
                         if (!(distance < max_distance)) continue;
                         target = matched;
+                    } else if(voxel_surfaces) {
+                        const auto near = exact_map->GetClosestSurfaceNeighbor(source,max_distance);
+                        if(!near)continue;
+                        normal = near->normal;target = near->point;
                     } else {
                         const auto near = index->Closest(source, max_distance);
                         if (!near) continue;
@@ -375,6 +381,11 @@ Sophus::SE3d Registration::AlignPointsToMap(const std::vector<Eigen::Vector3d> &
     if (voxel_map.Empty()) return initial_guess;
 
     if (surface.enabled) {
+        if(surface.directional_hybrid && surface.voxel_surface_index && voxel_map.SurfaceSize() >= 6) {
+            return AlignSurfaces(frame, {}, {}, initial_guess, max_distance, kernel_scale,
+                                 fix_rotation, rotation_prior_information, max_num_iterations_,
+                                 convergence_criterion_,surface,surface_diagnostics,&voxel_map);
+        }
         if (surface.covariance_regularization >= 1.0) {
             return AlignSurfaces(frame, {}, {}, initial_guess, max_distance, kernel_scale,
                                  fix_rotation, rotation_prior_information, max_num_iterations_,

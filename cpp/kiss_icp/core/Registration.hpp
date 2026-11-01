@@ -38,6 +38,7 @@ struct SurfaceOptions {
     double eigenvalue_ratio = 1e-4;
     double covariance_regularization = 0.01;
     bool directional_hybrid = false;
+    bool voxel_surface_index = false;
     double translation_eigenvalue_ratio = 0.02;
     bool inertial_translation_valid = false;
     bool covariance_inertial_prior = true;

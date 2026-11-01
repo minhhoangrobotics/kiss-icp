@@ -244,6 +244,11 @@ void OdometryServer::initializeParameters(kiss_icp::pipeline::KISSConfig &config
     if (!std::isfinite(regularization) || regularization <= 0.0 || regularization > 1.0)
         throw std::invalid_argument("registration.covariance_regularization must be in (0,1]");
     config.surface.directional_hybrid = metric == "hybrid";
+    config.surface.voxel_surface_index = declare_parameter<bool>("registration.voxel_surface_index",false);
+    if(config.surface.voxel_surface_index && !config.surface.directional_hybrid)
+        throw std::invalid_argument("registration.voxel_surface_index requires the hybrid metric");
+    RCLCPP_INFO(get_logger(),"KISS surface target index: %s",
+                config.surface.voxel_surface_index ? "exact voxel search" : "rebuilt KD-tree");
     config.surface.covariance_regularization = (metric == "point_to_plane" || metric == "hybrid") ? 0.0 :
                                                metric == "point_to_point_exact" ? 1.0 : regularization;
     config.surface.translation_eigenvalue_ratio = declare_parameter<double>(

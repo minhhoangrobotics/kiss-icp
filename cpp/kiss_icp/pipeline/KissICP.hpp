@@ -88,7 +88,8 @@ public:
           preprocessor_(config.max_range, config.min_range, config.deskew, config.max_num_threads),
           registration_(
               config.max_num_iterations, config.convergence_criterion, config.max_num_threads),
-          local_map_(config.voxel_size, config.max_range, config.max_points_per_voxel),
+          local_map_(config.voxel_size, config.max_range, config.max_points_per_voxel,
+                     config.surface.voxel_surface_index),
           adaptive_threshold_(config.initial_threshold, config.min_motion_th, config.max_range) {}
 
 public:
