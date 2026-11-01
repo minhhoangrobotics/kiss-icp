@@ -43,6 +43,7 @@ struct SurfaceOptions {
     bool covariance_inertial_prior = true;
     double correspondence_gate_sigma = 0.0; // 0 preserves ungated association; >0 is a normalized plane innovation.
     Eigen::Matrix3d inertial_information = Eigen::Matrix3d::Zero();
+    Eigen::Matrix3d attitude_information = Eigen::Matrix3d::Zero(); // voxel^2 * inverse left/world attitude covariance
 };
 
 struct SurfaceDiagnostics {

@@ -98,7 +98,8 @@ public:
                                       bool imu_orientation_valid = false,
                                       bool inertial_translation_valid = false,
                                       const std::function<Sophus::SE3d(const Sophus::SE3d&,const SurfaceDiagnostics&)>& state_update = {},
-                                      const std::optional<Eigen::Matrix3d>& inertial_covariance = std::nullopt);
+                                      const std::optional<Eigen::Matrix3d>& inertial_covariance = std::nullopt,
+                                      const std::optional<Eigen::Matrix3d>& attitude_covariance = std::nullopt);
     Vector3dVectorTuple Voxelize(const std::vector<Eigen::Vector3d> &frame) const;
 
     std::vector<Eigen::Vector3d> LocalMap() const { return local_map_.Pointcloud(); };

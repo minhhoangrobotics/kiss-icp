@@ -5,6 +5,7 @@
 #include <Eigen/Eigenvalues>
 #include <algorithm>
 #include <numeric>
+#include <optional>
 #include <queue>
 #include <utility>
 #include <vector>
@@ -33,6 +34,13 @@ public:
             heap.pop();
         }
         return result;
+    }
+    // The ICP hot path needs one neighbor, not a heap and two allocations for
+    // every point/iteration. Traverse the identical tree with scalar storage.
+    std::optional<std::pair<double,size_t>> Closest(const Eigen::Vector3d& query,double radius) const {
+        std::optional<std::pair<double,size_t>> best;
+        SearchClosest(root_,query,radius*radius,best);
+        return best;
     }
 
 private:
@@ -80,6 +88,18 @@ private:
         const double limit = heap.size() == count ? std::min(radius2, heap.top().first) : radius2;
         if (split * split <= limit)
             Search(split < 0.0 ? n.right : n.left, query, count, radius2, heap);
+    }
+    void SearchClosest(int node,const Eigen::Vector3d& query,double radius2,
+                       std::optional<std::pair<double,size_t>>& best) const {
+        if(node<0)return;
+        const auto& n=nodes_[static_cast<size_t>(node)];
+        const Eigen::Vector3d delta=query-points_[n.point];
+        const double d2=delta.squaredNorm();
+        if(d2<=radius2 && (!best || d2<best->first))best=std::make_pair(d2,n.point);
+        const double split=delta[n.axis];
+        SearchClosest(split<0?n.left:n.right,query,radius2,best);
+        const double limit=best?best->first:radius2;
+        if(split*split<=limit)SearchClosest(split<0?n.right:n.left,query,radius2,best);
     }
     const std::vector<Eigen::Vector3d>& points_;
     std::vector<size_t> order_;
