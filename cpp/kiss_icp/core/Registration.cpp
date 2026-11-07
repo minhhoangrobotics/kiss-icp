@@ -133,8 +133,10 @@ Sophus::SE3d AlignSurfaces(const std::vector<Eigen::Vector3d>& frame,
                            kiss_icp::SurfaceDiagnostics& diagnostics,
                            const kiss_icp::VoxelHashMap* exact_map = nullptr) {
     std::unique_ptr<kiss_icp::PointIndex> index;
-    if (options.covariance_regularization < 1.0) index = std::make_unique<kiss_icp::PointIndex>(targets);
-    const auto source_normals = options.covariance_regularization < 1.0 ?
+    const bool voxel_surfaces = options.voxel_surface_index && exact_map;
+    if (options.covariance_regularization < 1.0 && !voxel_surfaces)
+        index = std::make_unique<kiss_icp::PointIndex>(targets);
+    const auto source_normals = options.covariance_regularization > 0.0 && options.covariance_regularization < 1.0 ?
         kiss_icp::EstimateNormals(frame, options.neighbors, options.radius, options.planarity_ratio) :
         std::vector<Eigen::Vector3d>{};
     struct NormalSystem {
@@ -149,6 +151,8 @@ Sophus::SE3d AlignSurfaces(const std::vector<Eigen::Vector3d>& frame,
         Eigen::Vector3d point_gradient = Eigen::Vector3d::Zero();
     };
     kiss_icp::PlaneCorrespondenceGate gate;
+    const Eigen::Matrix3d attitude_information=options.attitude_information.trace()>0.0 ?
+        options.attitude_information : (rotation_information*Eigen::Matrix3d::Identity()).eval();
     if(options.correspondence_gate_sigma>0.0 && options.inertial_information.trace()>0.0 &&
        exact_map && rotation_information>0.0) {
         const double variance=exact_map->voxel_size_*exact_map->voxel_size_;
@@ -156,7 +160,7 @@ Sophus::SE3d AlignSurfaces(const std::vector<Eigen::Vector3d>& frame,
         if(prediction.info()==Eigen::Success && prediction.isPositive()) {
             gate.position_covariance=variance*prediction.solve(Eigen::Matrix3d::Identity());
             gate.surface_variance=variance/6.0;
-            gate.angular_variance=variance/rotation_information;
+            gate.attitude_covariance=variance*attitude_information.ldlt().solve(Eigen::Matrix3d::Identity());
             gate.squared_sigma=options.correspondence_gate_sigma*options.correspondence_gate_sigma;
             gate.enabled=gate.position_covariance.allFinite();
         }
@@ -185,10 +189,14 @@ Sophus::SE3d AlignSurfaces(const std::vector<Eigen::Vector3d>& frame,
                         const auto [matched, distance] = exact_map->GetClosestNeighbor(source, max_distance);
                         if (!(distance < max_distance)) continue;
                         target = matched;
+                    } else if(voxel_surfaces) {
+                        const auto near = exact_map->GetClosestSurfaceNeighbor(source,max_distance);
+                        if(!near)continue;
+                        normal = near->normal;target = near->point;
                     } else {
-                        const auto near = index->Neighbors(source, 1, max_distance);
-                        if (near.empty()) continue;
-                        const size_t match = near.front().second;
+                        const auto near = index->Closest(source, max_distance);
+                        if (!near) continue;
+                        const size_t match = near->second;
                         normal = normals[match];
                         target = targets[match];
                     }
@@ -316,8 +324,8 @@ Sophus::SE3d AlignSurfaces(const std::vector<Eigen::Vector3d>& frame,
         diagnostics.pose_information=system.measured_H;
         diagnostics.pose_gradient=system.measured_b;
         // The absolute scan-time IMU attitude is a measurement, not a clamp.
-        H.bottomRightCorner<3, 3>().diagonal().array() += rotation_information;
-        b.tail<3>() += rotation_information * (estimate.so3() * initial_guess.so3().inverse()).log();
+        H.bottomRightCorner<3, 3>() += attitude_information;
+        b.tail<3>() += attitude_information * (estimate.so3() * initial_guess.so3().inverse()).log();
         if (fix_rotation) {
             H.bottomRows<3>().setZero();
             H.rightCols<3>().setZero();
@@ -373,6 +381,11 @@ Sophus::SE3d Registration::AlignPointsToMap(const std::vector<Eigen::Vector3d> &
     if (voxel_map.Empty()) return initial_guess;
 
     if (surface.enabled) {
+        if(surface.directional_hybrid && surface.voxel_surface_index && voxel_map.SurfaceSize() >= 6) {
+            return AlignSurfaces(frame, {}, {}, initial_guess, max_distance, kernel_scale,
+                                 fix_rotation, rotation_prior_information, max_num_iterations_,
+                                 convergence_criterion_,surface,surface_diagnostics,&voxel_map);
+        }
         if (surface.covariance_regularization >= 1.0) {
             return AlignSurfaces(frame, {}, {}, initial_guess, max_distance, kernel_scale,
                                  fix_rotation, rotation_prior_information, max_num_iterations_,
@@ -403,15 +416,17 @@ Sophus::SE3d Registration::AlignPointsToMap(const std::vector<Eigen::Vector3d> &
         if (correspondences.size() < 6) break;
         // Equation (11)
         auto [JTJ, JTr] = BuildLinearSystem(correspondences, kernel_scale);
-        if (rotation_prior_information > 0.0) {
+        const Eigen::Matrix3d attitude_information=surface.attitude_information.trace()>0.0 ?
+            surface.attitude_information : (rotation_prior_information*Eigen::Matrix3d::Identity()).eval();
+        if (attitude_information.trace() > 0.0) {
             // Use the scan-time IMU as an orientation measurement. Penalize
             // deviation from it while allowing geometry to correct the pose.
             // ICP uses left increments, so the prior residual is expressed in
             // the same world tangent as the rotational Jacobian.
             const Eigen::Vector3d rotation_error =
                 (T_icp.so3()).log();
-            JTJ.bottomRightCorner<3, 3>().diagonal().array() += rotation_prior_information;
-            JTr.tail<3>() += rotation_prior_information * rotation_error;
+            JTJ.bottomRightCorner<3, 3>() += attitude_information;
+            JTr.tail<3>() += attitude_information * rotation_error;
         }
         Eigen::Vector6d dx = Eigen::Vector6d::Zero();
         if (fix_rotation) {

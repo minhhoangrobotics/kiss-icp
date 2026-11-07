@@ -24,6 +24,7 @@
 #include <Eigen/Core>
 #include <algorithm>
 #include <cmath>
+#include <ctime>
 #include <memory>
 #include <stdexcept>
 #include <sophus/se3.hpp>
@@ -34,6 +35,7 @@
 #include "OdometryServer.hpp"
 #include "kiss_icp/core/GravityFrame.hpp"
 #include "kiss_icp/core/InertialPoseUpdate.hpp"
+#include "kiss_icp/core/AttitudeCovariance.hpp"
 #include "Utils.hpp"
 
 // KISS-ICP
@@ -160,6 +162,7 @@ OdometryServer::OdometryServer(const rclcpp::NodeOptions &options)
         "kiss/registration_accepted", qos);
     quality_publisher_ = create_publisher<std_msgs::msg::Float32MultiArray>(
         "kiss/registration_quality", qos);
+    timing_publisher_=create_publisher<std_msgs::msg::Float64MultiArray>("kiss/timing",10);
     if (publish_debug_clouds_) {
         frame_publisher_ = create_publisher<sensor_msgs::msg::PointCloud2>("kiss/frame", qos);
         kpoints_publisher_ = create_publisher<sensor_msgs::msg::PointCloud2>("kiss/keypoints", qos);
@@ -228,6 +231,10 @@ void OdometryServer::initializeParameters(kiss_icp::pipeline::KISSConfig &config
         "registration.fix_rotation_from_imu", config.fix_rotation_from_hint);
     config.rotation_prior_information = declare_parameter<double>(
         "registration.rotation_prior_information", config.rotation_prior_information);
+    use_imu_attitude_covariance_=declare_parameter<bool>("registration.use_imu_orientation_covariance",false);
+    imu_attitude_model_noise_=declare_parameter<double>("registration.imu_attitude_model_noise",0.001);
+    if(!std::isfinite(imu_attitude_model_noise_) || imu_attitude_model_noise_<0)
+        throw std::invalid_argument("imu_attitude_model_noise must be finite and nonnegative");
     const auto metric = declare_parameter<std::string>("registration.metric", "point_to_point");
     if (metric != "point_to_point" && metric != "point_to_point_exact" &&
         metric != "point_to_plane" && metric != "generalized_icp" && metric != "hybrid")
@@ -237,6 +244,11 @@ void OdometryServer::initializeParameters(kiss_icp::pipeline::KISSConfig &config
     if (!std::isfinite(regularization) || regularization <= 0.0 || regularization > 1.0)
         throw std::invalid_argument("registration.covariance_regularization must be in (0,1]");
     config.surface.directional_hybrid = metric == "hybrid";
+    config.surface.voxel_surface_index = declare_parameter<bool>("registration.voxel_surface_index",false);
+    if(config.surface.voxel_surface_index && !config.surface.directional_hybrid)
+        throw std::invalid_argument("registration.voxel_surface_index requires the hybrid metric");
+    RCLCPP_INFO(get_logger(),"KISS surface target index: %s",
+                config.surface.voxel_surface_index ? "exact voxel search" : "rebuilt KD-tree");
     config.surface.covariance_regularization = (metric == "point_to_plane" || metric == "hybrid") ? 0.0 :
                                                metric == "point_to_point_exact" ? 1.0 : regularization;
     config.surface.translation_eigenvalue_ratio = declare_parameter<double>(
@@ -286,6 +298,28 @@ void OdometryServer::initializeParameters(kiss_icp::pipeline::KISSConfig &config
 }
 
 void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg) {
+    const auto timing_start=std::chrono::steady_clock::now();
+    const auto process_cpu_start=std::clock();
+    timespec thread_cpu_start{};
+    const bool have_thread_cpu=clock_gettime(CLOCK_THREAD_CPUTIME_ID,&thread_cpu_start)==0;
+    auto elapsed=[&]{return std::chrono::duration<double>(std::chrono::steady_clock::now()-timing_start).count();};
+    std_msgs::msg::Float64MultiArray timing;
+    timing.data={rclcpp::Time(msg->header.stamp).seconds(),(now()-rclcpp::Time(msg->header.stamp)).seconds(),0,0,0,0,-1,0,-1,-1};
+    auto finish=[&]{if(!rclcpp::ok(get_node_base_interface()->get_context()))return;
+      timing.data[5]=elapsed();if(timing.data[2]==0)timing.data[2]=timing.data[5];
+      const auto process_cpu_end=std::clock();
+      if(process_cpu_start!=static_cast<std::clock_t>(-1) && process_cpu_end!=static_cast<std::clock_t>(-1))
+        timing.data[8]=static_cast<double>(process_cpu_end-process_cpu_start)/CLOCKS_PER_SEC;
+      timespec thread_cpu_end{};
+      if(have_thread_cpu && clock_gettime(CLOCK_THREAD_CPUTIME_ID,&thread_cpu_end)==0)
+        timing.data[9]=static_cast<double>(thread_cpu_end.tv_sec-thread_cpu_start.tv_sec)+
+                       static_cast<double>(thread_cpu_end.tv_nsec-thread_cpu_start.tv_nsec)*1e-9;
+      timing.layout.dim.resize(1);timing.layout.dim[0].size=10;timing.layout.dim[0].stride=10;
+      // CPU includes TBB workers and concurrent callbacks in this process;
+      // unlike wall time it does not count time descheduled by the host.
+      timing.layout.dim[0].label="stamp,age_start_s,tf_wait_s,imu_wait_s,registration_s,total_s,accepted,attitude_covariance_used,process_cpu_s,callback_thread_cpu_s";
+      timing_publisher_->publish(timing);};
+    struct TimingExit {decltype(finish)& callback;~TimingExit(){callback();}} timing_exit{finish};
     Sophus::SE3d base_to_lidar;
     if (!base_frame_.empty() && base_frame_ != msg->header.frame_id) {
         try {
@@ -302,11 +336,13 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
     const auto leg_pose = (use_leg_prediction_ || use_leg_height_constraint_) ?
                           LegPoseAt(rclcpp::Time(msg->header.stamp)) :
                                             std::optional<Sophus::SE3d>{};
+    timing.data[2]=elapsed();
     if (use_leg_prediction_ && !leg_pose) {
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
                              "No leg odometry near LiDAR timestamp; KISS uses its own motion estimate");
     }
     if (use_inertial_translation_) {
+        const double wait_start=elapsed();
         // Sensor callbacks have their own executor group/thread. Wait for the
         // upper interpolation sample, releasing the queue mutex while waiting.
         // A late sample is not missing motion and must never reset velocity.
@@ -317,6 +353,7 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
                    rclcpp::Time(recent_imu_.front()->header.stamp)<=scan_stamp &&
                    rclcpp::Time(recent_imu_.back()->header.stamp)>=scan_stamp;
         });
+        timing.data[3]=elapsed()-wait_start;
         if (!covered) {
             RCLCPP_WARN_THROTTLE(get_logger(),*get_clock(),2000,
                 "Skipping LiDAR update: scan-time IMU bracket unavailable after %.0f ms; preserving inertial state",
@@ -466,9 +503,17 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
     // Register frame, main entry point to KISS-ICP pipeline
     const std::optional<Eigen::Matrix3d> inertial_covariance=inertial_translation_valid ?
         std::optional<Eigen::Matrix3d>(inertial_prediction_.covariance().topLeftCorner<3,3>()) : std::nullopt;
+    std::optional<Eigen::Matrix3d> attitude_covariance;
+    if(use_imu_attitude_covariance_ && scan_imu_world_covariance_ && odom_from_imu_orientation_) {
+        const Eigen::Matrix3d R=odom_from_imu_orientation_->toRotationMatrix();
+        attitude_covariance=(R*(*scan_imu_world_covariance_)*R.transpose()).eval();
+    }
+    timing.data[7]=attitude_covariance?1:0;
+    const double registration_start=elapsed();
     auto registration = kiss_icp_->RegisterFrame(points, timestamps, pose_hint,
                                                  imu_orientation.has_value(), inertial_translation_valid,state_update,
-                                                 inertial_covariance);
+                                                 inertial_covariance,attitude_covariance);
+    timing.data[4]=elapsed()-registration_start;
     const auto &first_quality = kiss_icp_->registration_quality();
     const double rejected_age = previous_scan_stamp_.nanoseconds() == 0 ? 0.0 :
         (rclcpp::Time(msg->header.stamp) - previous_scan_stamp_).seconds();
@@ -500,6 +545,7 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
     }
     const auto &[frame, keypoints] = registration;
     const auto &quality = kiss_icp_->registration_quality();
+    timing.data[6]=quality.accepted?1:0;
     const auto& surface = kiss_icp_->surface_diagnostics();
     if(surface.inconsistent_correspondences>0) {
         RCLCPP_INFO_THROTTLE(get_logger(),*get_clock(),5000,
@@ -636,6 +682,7 @@ std::optional<Sophus::SE3d> OdometryServer::LegPoseAt(const rclcpp::Time &stamp)
 }
 
 std::optional<Eigen::Quaterniond> OdometryServer::ImuBaseOrientationAt(const rclcpp::Time &stamp) {
+    scan_imu_world_covariance_.reset();
     sensor_msgs::msg::Imu::ConstSharedPtr before, after;
     {
         std::lock_guard<std::mutex> lock(sensor_queue_mutex_);
@@ -667,6 +714,26 @@ std::optional<Eigen::Quaterniond> OdometryServer::ImuBaseOrientationAt(const rcl
         }
     }
     if (!world_imu.coeffs().allFinite() || world_imu.norm() < 0.5) return std::nullopt;
+    auto world_covariance=[&](const sensor_msgs::msg::Imu::ConstSharedPtr& item)->std::optional<Eigen::Matrix3d> {
+        if(!item)return std::nullopt;
+        const Eigen::Matrix3d covariance=Eigen::Map<const Eigen::Matrix<double,3,3,Eigen::RowMajor>>(
+            item->orientation_covariance.data());
+        if(!kiss_icp::ValidAttitudeCovariance(covariance))return std::nullopt;
+        const Eigen::Matrix3d R=from_msg(item).toRotationMatrix();
+        return (R*covariance*R.transpose()).eval();
+    };
+    scan_imu_world_covariance_=world_covariance(sample);
+    if(before && after) {
+        const double dt=(rclcpp::Time(after->header.stamp)-rclcpp::Time(before->header.stamp)).seconds();
+        const auto c0=world_covariance(before),c1=world_covariance(after);
+        if(c0 && c1 && dt>0 && dt<.04) {
+            const double u=(stamp-rclcpp::Time(before->header.stamp)).seconds()/dt;
+            // Convex mixture retains uncertainty shared by correlated EKF samples.
+            scan_imu_world_covariance_=((1-u)*(*c0)+u*(*c1)).eval();
+        }
+    }
+    if(scan_imu_world_covariance_)
+        scan_imu_world_covariance_->diagonal().array()+=imu_attitude_model_noise_*imu_attitude_model_noise_;
     if (!base_to_imu_rotation_ || cached_imu_frame_ != sample->header.frame_id) {
         try {
             // The G1 IMU is rigidly attached to pelvis/base_link. Cache the
@@ -741,6 +808,24 @@ void OdometryServer::PublishOdometry(const Sophus::SE3d &kiss_pose,
         const Eigen::Matrix3d position_covariance=R*inertial_prediction_.covariance().topLeftCorner<3,3>()*R.transpose();
         for(int i=0;i<3;++i)for(int j=0;j<3;++j)
             odom_msg.pose.covariance[static_cast<size_t>(6*i+j)]=position_covariance(i,j);
+    }
+    if(use_imu_attitude_covariance_ && scan_imu_world_covariance_ && odom_from_imu_orientation_ && imu_orientation) {
+        const Eigen::Matrix3d anchor=odom_from_imu_orientation_->toRotationMatrix();
+        const Sophus::SO3d prior((*odom_from_imu_orientation_ * *imu_orientation).normalized());
+        const Eigen::Vector3d disagreement=(internal_from_base.so3()*prior.inverse()).log();
+        // This is a conservative posterior uncertainty model, not a second
+        // independent IMU likelihood: include the actual ICP/IMU disagreement.
+        const Eigen::Matrix3d internal=anchor*(*scan_imu_world_covariance_)*anchor.transpose()+disagreement*disagreement.transpose();
+        const Eigen::Matrix3d rotation=output_from_internal_->rotationMatrix();
+        const Eigen::Matrix3d C=rotation*internal*rotation.transpose();
+        const Eigen::Matrix3d lever= Sophus::SO3d::hat(pose.so3()*base_to_imu_translation_);
+        const Eigen::Matrix3d cross=lever*C,extra=lever*C*lever.transpose();
+        for(int i=0;i<3;++i)for(int j=0;j<3;++j) {
+            odom_msg.pose.covariance[static_cast<size_t>(6*(i+3)+j+3)]=C(i,j);
+            odom_msg.pose.covariance[static_cast<size_t>(6*i+j+3)]=cross(i,j);
+            odom_msg.pose.covariance[static_cast<size_t>(6*(j+3)+i)]=cross(i,j);
+            odom_msg.pose.covariance[static_cast<size_t>(6*i+j)]+=extra(i,j);
+        }
     }
     odom_publisher_->publish(odom_msg);
     const auto likelihood=kiss_icp::IndependentLidarLikelihood(kiss_icp_->surface_diagnostics(),

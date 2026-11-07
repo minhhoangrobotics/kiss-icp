@@ -38,11 +38,13 @@ struct SurfaceOptions {
     double eigenvalue_ratio = 1e-4;
     double covariance_regularization = 0.01;
     bool directional_hybrid = false;
+    bool voxel_surface_index = false;
     double translation_eigenvalue_ratio = 0.02;
     bool inertial_translation_valid = false;
     bool covariance_inertial_prior = true;
     double correspondence_gate_sigma = 0.0; // 0 preserves ungated association; >0 is a normalized plane innovation.
     Eigen::Matrix3d inertial_information = Eigen::Matrix3d::Zero();
+    Eigen::Matrix3d attitude_information = Eigen::Matrix3d::Zero(); // voxel^2 * inverse left/world attitude covariance
 };
 
 struct SurfaceDiagnostics {

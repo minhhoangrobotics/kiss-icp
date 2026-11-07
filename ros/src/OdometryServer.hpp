@@ -32,6 +32,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
 #include <std_msgs/msg/header.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
@@ -94,6 +95,10 @@ private:
     mutable std::mutex sensor_queue_mutex_;
     std::condition_variable imu_arrived_;
     double imu_wait_timeout_ = 0.06;
+    bool use_imu_attitude_covariance_=false;
+    double imu_attitude_model_noise_=0.001;
+    std::optional<Eigen::Matrix3d> scan_imu_world_covariance_;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr timing_publisher_;
     std::deque<nav_msgs::msg::Odometry::ConstSharedPtr> recent_leg_poses_;
     std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> recent_imu_;
     std::optional<Sophus::SE3d> previous_leg_pose_;

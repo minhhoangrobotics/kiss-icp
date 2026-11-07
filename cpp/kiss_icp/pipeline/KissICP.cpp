@@ -33,6 +33,7 @@
 #include "kiss_icp/core/Registration.hpp"
 #include "kiss_icp/core/VoxelHashMap.hpp"
 #include "kiss_icp/core/Surface.hpp"
+#include "kiss_icp/core/AttitudeCovariance.hpp"
 
 namespace kiss_icp::pipeline {
 
@@ -42,7 +43,8 @@ KissICP::Vector3dVectorTuple KissICP::RegisterFrame(const std::vector<Eigen::Vec
                                                     bool imu_orientation_valid,
                                                     bool inertial_translation_valid,
                                                     const std::function<Sophus::SE3d(const Sophus::SE3d&,const SurfaceDiagnostics&)>& state_update,
-                                                    const std::optional<Eigen::Matrix3d>& inertial_covariance) {
+                                                    const std::optional<Eigen::Matrix3d>& inertial_covariance,
+                                                    const std::optional<Eigen::Matrix3d>& attitude_covariance) {
     // Preprocess the input cloud
     const auto &preprocessed_frame = preprocessor_.Preprocess(frame, timestamps, last_delta_);
 
@@ -58,6 +60,9 @@ KissICP::Vector3dVectorTuple KissICP::RegisterFrame(const std::vector<Eigen::Vec
     // Run ICP
     const bool imu_prior_valid = imu_orientation_valid && pose_hint.has_value();
     auto surface = config_.surface;
+    if(imu_prior_valid && attitude_covariance && ValidAttitudeCovariance(*attitude_covariance))
+        surface.attitude_information=config_.voxel_size*config_.voxel_size*
+            attitude_covariance->ldlt().solve(Eigen::Matrix3d::Identity());
     surface.inertial_translation_valid = inertial_translation_valid && imu_prior_valid;
     if(inertial_covariance && surface.inertial_translation_valid) {
         surface.inertial_information=config_.voxel_size*config_.voxel_size*

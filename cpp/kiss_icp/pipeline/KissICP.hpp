@@ -88,7 +88,8 @@ public:
           preprocessor_(config.max_range, config.min_range, config.deskew, config.max_num_threads),
           registration_(
               config.max_num_iterations, config.convergence_criterion, config.max_num_threads),
-          local_map_(config.voxel_size, config.max_range, config.max_points_per_voxel),
+          local_map_(config.voxel_size, config.max_range, config.max_points_per_voxel,
+                     config.surface.voxel_surface_index),
           adaptive_threshold_(config.initial_threshold, config.min_motion_th, config.max_range) {}
 
 public:
@@ -98,7 +99,8 @@ public:
                                       bool imu_orientation_valid = false,
                                       bool inertial_translation_valid = false,
                                       const std::function<Sophus::SE3d(const Sophus::SE3d&,const SurfaceDiagnostics&)>& state_update = {},
-                                      const std::optional<Eigen::Matrix3d>& inertial_covariance = std::nullopt);
+                                      const std::optional<Eigen::Matrix3d>& inertial_covariance = std::nullopt,
+                                      const std::optional<Eigen::Matrix3d>& attitude_covariance = std::nullopt);
     Vector3dVectorTuple Voxelize(const std::vector<Eigen::Vector3d> &frame) const;
 
     std::vector<Eigen::Vector3d> LocalMap() const { return local_map_.Pointcloud(); };

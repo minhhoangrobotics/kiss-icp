@@ -11,13 +11,15 @@ struct PlaneCorrespondenceGate {
     bool enabled=false;
     double squared_sigma=0.0, surface_variance=0.0, angular_variance=0.0;
     Eigen::Matrix3d position_covariance=Eigen::Matrix3d::Zero();
+    Eigen::Matrix3d attitude_covariance=Eigen::Matrix3d::Zero();
     double SquaredInnovation(const Eigen::Vector3d& predicted_lever,
                              const Eigen::Vector3d& predicted_position,
                              const Eigen::Vector3d& target,
                              const Eigen::Vector3d& normal) const {
         const double residual=normal.dot(predicted_lever+predicted_position-target);
+        const Eigen::Vector3d angular=predicted_lever.cross(normal);
         const double variance=surface_variance+normal.dot(position_covariance*normal)+
-            angular_variance*predicted_lever.cross(normal).squaredNorm();
+            angular_variance*angular.squaredNorm()+angular.dot(attitude_covariance*angular);
         return variance>0.0?residual*residual/variance:0.0;
     }
     bool Accept(double squared_innovation) const {

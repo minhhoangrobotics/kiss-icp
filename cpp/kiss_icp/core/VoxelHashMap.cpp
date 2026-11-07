@@ -81,6 +81,55 @@ std::vector<Eigen::Vector3d> VoxelHashMap::Pointcloud() const {
     return points;
 }
 
+std::optional<VoxelHashMap::SurfaceNeighbor> VoxelHashMap::GetClosestSurfaceNeighbor(
+    const Eigen::Vector3d& query, double max_distance) const {
+    if(surface_points_ == 0 || !query.allFinite() || !std::isfinite(max_distance) || max_distance < 0)
+        return std::nullopt;
+    const double cell_size = voxel_size_ * (surface_index_enabled_ ? 4.0 : 1.0);
+    const Voxel fine_center = PointToVoxel(query,voxel_size_);
+    const Voxel center = surface_index_enabled_ ? SurfaceBucket(fine_center) : fine_center;
+    const int limit = static_cast<int>(std::ceil(max_distance / cell_size));
+    double best2 = max_distance * max_distance;
+    std::optional<SurfaceNeighbor> best;
+    auto consider = [&](const Voxel& voxel) {
+        const Eigen::Vector3d low = voxel.cast<double>() * voxel_size_;
+        const Eigen::Vector3d high = low.array() + voxel_size_;
+        if((low-query).cwiseMax(query-high).cwiseMax(0.0).squaredNorm() > best2)return;
+        const auto points = map_.find(voxel);
+        const auto normals = normals_.find(voxel);
+        if(points == map_.end() || normals == normals_.end())return;
+        const size_t count = std::min(points.value().size(),normals.value().size());
+        for(size_t i = 0; i < count; ++i) {
+            if(normals.value()[i].squaredNorm() < .5)continue;
+            const double distance2 = (points.value()[i]-query).squaredNorm();
+            if(distance2 <= best2 && (!best || distance2 < best2)) {
+                best2 = distance2;best = SurfaceNeighbor{points.value()[i],normals.value()[i],std::sqrt(distance2)};
+            }
+        }
+    };
+    // Coarse buckets contain fine voxel keys, not copied points. Updates and
+    // eviction maintain them incrementally; no per-scan target/tree rebuild.
+    // Expanding shells and AABB bounds preserve the exact search radius.
+    for(int ring = 0; ring <= limit; ++ring) {
+        for(int x = -ring; x <= ring; ++x)for(int y = -ring; y <= ring; ++y)for(int z = -ring; z <= ring; ++z) {
+            if(std::max({std::abs(x),std::abs(y),std::abs(z)}) != ring)continue;
+            const Voxel cell = center + Voxel(x,y,z);
+            const Eigen::Vector3d low = cell.cast<double>() * cell_size;
+            const Eigen::Vector3d high = low.array() + cell_size;
+            if((low-query).cwiseMax(query-high).cwiseMax(0.0).squaredNorm() > best2)continue;
+            if(surface_index_enabled_) {
+                const auto bucket = surface_buckets_.find(cell);
+                if(bucket != surface_buckets_.end())for(const auto& voxel:bucket.value())consider(voxel);
+            } else consider(cell);
+        }
+        const Eigen::Vector3d low = (center.array()-ring).matrix().cast<double>() * cell_size;
+        const Eigen::Vector3d high = (center.array()+ring+1).matrix().cast<double>() * cell_size;
+        const double unsearched = (query-low).cwiseMin(high-query).minCoeff();
+        if(best && unsearched*unsearched > best2)break;
+    }
+    return best;
+}
+
 std::tuple<Eigen::Vector3d, double> VoxelHashMap::GetClosestNeighbor(
     const Eigen::Vector3d& query, double max_distance) const {
     const Voxel center = PointToVoxel(query, voxel_size_);
@@ -175,6 +224,12 @@ void VoxelHashMap::AddPoints(const std::vector<Eigen::Vector3d> &points,
         const auto& point = points[i];
         const Eigen::Vector3d normal = normals.empty() ? Eigen::Vector3d::Zero().eval() : normals[i];
         const auto voxel = PointToVoxel(point, voxel_size_);
+        bool first_surface = false;
+        if(surface_index_enabled_ && !normals.empty() && normal.squaredNorm() >= .5) {
+            const auto old = normals_.find(voxel);
+            first_surface = old == normals_.end() || std::none_of(old.value().begin(),old.value().end(),
+                [](const Eigen::Vector3d& n){return n.squaredNorm() >= .5;});
+        }
         auto search = map_.find(voxel);
         if (search != map_.end()) {
             auto &voxel_points = search.value();
@@ -191,13 +246,16 @@ void VoxelHashMap::AddPoints(const std::vector<Eigen::Vector3d> &points,
                 voxel_normals.emplace_back(normal);
             }
             voxel_points.emplace_back(point);
+            if(!normals.empty() && normal.squaredNorm() >= .5)++surface_points_;
         } else {
             std::vector<Eigen::Vector3d> voxel_points;
             voxel_points.reserve(max_points_per_voxel_);
             voxel_points.emplace_back(point);
             map_.insert({voxel, std::move(voxel_points)});
             if (!normals.empty()) normals_[voxel] = {normal};
+            if(!normals.empty() && normal.squaredNorm() >= .5)++surface_points_;
         }
+        if(first_surface)surface_buckets_[SurfaceBucket(voxel)].push_back(voxel);
     }
 }
 
@@ -207,6 +265,19 @@ void VoxelHashMap::RemovePointsFarFromLocation(const Eigen::Vector3d &origin) {
         const auto &[voxel, voxel_points] = *it;
         const auto &pt = voxel_points.front();
         if ((pt - origin).squaredNorm() >= (max_distance2)) {
+            const auto found = normals_.find(voxel);
+            if(found != normals_.end())
+                for(const auto& normal:found.value())if(normal.squaredNorm() >= .5)--surface_points_;
+            if(surface_index_enabled_) {
+                const Voxel key = SurfaceBucket(voxel);
+                auto bucket = surface_buckets_.find(key);
+                if(bucket != surface_buckets_.end()) {
+                    auto& cells = bucket.value();
+                    cells.erase(std::remove_if(cells.begin(),cells.end(),[&](const Voxel& cell){
+                        return (cell.array()==voxel.array()).all();}),cells.end());
+                    if(cells.empty())surface_buckets_.erase(key);
+                }
+            }
             normals_.erase(voxel);
             it = map_.erase(it);
         } else {
